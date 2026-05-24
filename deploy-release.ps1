@@ -76,9 +76,9 @@ function Add-QueryString {
         [hashtable]$Parameters
     )
 
-    $pairs = foreach ($key in $Parameters.Keys) {
+    $pairs = @(foreach ($key in $Parameters.Keys) {
         "{0}={1}" -f (ConvertTo-UrlEncoded $key), (ConvertTo-UrlEncoded ([string]$Parameters[$key]))
-    }
+    })
 
     if ($pairs.Count -eq 0) {
         return $Uri
