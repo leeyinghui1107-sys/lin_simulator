@@ -217,7 +217,7 @@ $env:GITEE_TOKEN = "<gitee-token>"
 .\deploy-release.ps1
 ```
 
-`deploy-release.ps1` 默认发布版本 `v0.1.0`，会先调用 `build.ps1 -Clean` 生成 `dist\`，确保本地 Git tag 指向当前 `HEAD`，再把 tag 推送到 GitHub `origin` 和 Gitee `gitee`，最后把 `dist\` 下的文件作为 Release 附件同步上传到两个平台。脚本不保存令牌；令牌可通过环境变量传入，也可通过 `-GitHubToken` 和 `-GiteeToken` 参数传入。发布前可用 `-DryRun -NoBuild` 预览动作。
+`deploy-release.ps1` 默认发布版本 `v0.1.0`，会先调用 `build.ps1 -Clean` 生成 `dist\`，确保本地 Git tag 指向当前 `HEAD`，再把 tag 推送到 GitHub `origin` 和 Gitee `gitee`，最后把 `dist\` 下的文件作为 Release 附件同步上传到两个平台。脚本不保存令牌；令牌可通过环境变量传入，也可通过 `-GitHubToken` 和 `-GiteeToken` 参数传入。发布前可用 `-DryRun -NoBuild` 预览动作；如需把已存在但不指向当前 `HEAD` 的 tag 移动到当前提交，可显式传入 `-ForceTag`。
 
 ### 本地检查
 

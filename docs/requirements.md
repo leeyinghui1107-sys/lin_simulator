@@ -48,6 +48,7 @@
 - `protocol.zip` 由 `protocol/` 目录内容压缩生成，压缩包根目录直接包含协议文件，不保留顶层 `protocol/` 目录。
 - `protocol/` 目录必须存在且非空；缺失或为空时发布构建失败。
 - `deploy-release.ps1` 默认发布 `v0.1.0`，同时支持 GitHub `origin` 和 Gitee `gitee`，并上传 `dist/` 下的顶层文件作为 Release 附件。
+- 已存在的发布 tag 默认必须指向当前 `HEAD`；需要覆盖移动 tag 时必须显式传入 `-ForceTag`。
 - GitHub/Gitee 令牌只能通过环境变量或脚本参数传入，不得写入仓库文件。
 
 ## 6. 测试数据说明

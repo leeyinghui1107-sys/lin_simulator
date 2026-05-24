@@ -29,6 +29,7 @@ param(
     [switch]$NoBuild,
     [switch]$NoClean,
     [switch]$NoTagPush,
+    [switch]$ForceTag,
     [switch]$AllowDirty,
     [switch]$Prerelease,
     [switch]$DryRun
@@ -246,7 +247,8 @@ function Assert-CleanGitTree {
 
 function Ensure-ReleaseTag {
     if ($DryRun) {
-        Write-Host "[dry-run] Ensure git tag $Tag points to HEAD" -ForegroundColor Yellow
+        $forceText = if ($ForceTag) { " with force update" } else { "" }
+        Write-Host "[dry-run] Ensure git tag $Tag points to HEAD$forceText" -ForegroundColor Yellow
         return
     }
 
@@ -269,7 +271,14 @@ function Ensure-ReleaseTag {
         }
 
         if ($tagCommit -ne $head) {
-            throw "Tag $Tag exists but does not point to HEAD. Move it manually if this is intentional."
+            if (-not $ForceTag) {
+                throw "Tag $Tag exists but does not point to HEAD. Rerun with -ForceTag to move it to HEAD."
+            }
+
+            Invoke-Native -FilePath "git" -Arguments @("tag", "-d", $Tag)
+            Invoke-Native -FilePath "git" -Arguments @("tag", "-a", $Tag, "-m", "Release $Tag")
+            Write-Host "Moved git tag to HEAD: $Tag" -ForegroundColor Yellow
+            return
         }
 
         Write-Host "Git tag exists: $Tag" -ForegroundColor Green
@@ -289,11 +298,18 @@ function Push-ReleaseTag {
     }
 
     if ($DryRun) {
-        Write-Host "[dry-run] git push $Remote refs/tags/$Tag" -ForegroundColor Yellow
+        $forceText = if ($ForceTag) { " --force" } else { "" }
+        Write-Host "[dry-run] git push$forceText $Remote refs/tags/$Tag" -ForegroundColor Yellow
         return
     }
 
-    Invoke-Native -FilePath "git" -Arguments @("push", $Remote, "refs/tags/$Tag")
+    $arguments = @("push")
+    if ($ForceTag) {
+        $arguments += "--force"
+    }
+    $arguments += @($Remote, "refs/tags/$Tag")
+
+    Invoke-Native -FilePath "git" -Arguments $arguments
 }
 
 function Invoke-ReleaseBuild {

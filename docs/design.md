@@ -137,7 +137,7 @@ ORDER BY p.port, c.command_key, c.port_id, c.seq;
 
 - 延续本地部署脚本的路径处理方式，要求 `dist/` 位于项目根目录内，且不能直接指向项目根目录。
 - 默认调用 `build.ps1 -Clean` 重新生成发布产物，也可用 `-NoBuild` 复用现有 `dist/`。
-- 校验工作区干净，创建或复用指向当前 `HEAD` 的 Git tag，并推送 tag 到两个远程。
+- 校验工作区干净，创建或复用指向当前 `HEAD` 的 Git tag，并推送 tag 到两个远程；已存在 tag 不指向当前 `HEAD` 时默认退出，传入 `-ForceTag` 时会移动本地 tag 并强制推送远程 tag。
 - 通过 GitHub Release API 和 Gitee Release API 创建或复用 Release，并上传 `dist/` 下的顶层文件，包括 8 个平台主程序、`simulator.db` 和 `protocol.zip`。
 - `GITHUB_TOKEN` / `GH_TOKEN` 和 `GITEE_TOKEN` 仅从环境变量或参数读取，不写入仓库文件。
 
