@@ -307,17 +307,24 @@ function Invoke-ReleaseBuild {
         throw "Build script not found: $buildScript"
     }
 
-    $arguments = @("-DistDir", $DistFull)
+    $buildParams = @{
+        DistDir = $DistFull
+    }
+
     if (-not $NoClean) {
-        $arguments += "-Clean"
+        $buildParams.Clean = $true
     }
 
     if ($DryRun) {
-        Write-Host "[dry-run] $buildScript $($arguments -join ' ')" -ForegroundColor Yellow
+        $cleanText = if ($NoClean) { "" } else { " -Clean" }
+        Write-Host "[dry-run] $buildScript -DistDir $DistFull$cleanText" -ForegroundColor Yellow
         return
     }
 
-    Invoke-Native -FilePath $buildScript -Arguments $arguments
+    & $buildScript @buildParams
+    if ($LASTEXITCODE -ne 0) {
+        throw "Build failed: $buildScript"
+    }
 }
 
 function Get-DistAssets {
