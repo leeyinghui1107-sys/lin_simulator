@@ -1,12 +1,12 @@
 # 林霖动环数据模拟器
 
-林霖动环数据模拟器是一个基于 TCP 的轻量设备数据模拟服务。程序从本地 SQLite 快照 `simulator.db` 一次性加载端口、命令和响应数据，在本机或指定网卡地址上监听 TCP 端口，用于联调、演示和离线测试动环采集链路。
+林霖动环数据模拟器是一个基于 TCP 的轻量设备数据模拟服务。程序从本地 SQLite 快照 `simulator.db` 一次性加载端口、命令和响应数据，加载完成后关闭数据库连接，并在本机或指定网卡地址上监听 TCP 端口，用于联调、演示和离线测试动环采集链路。
 
 ## 环境要求
 
 - Go 1.21+
 - 纯 Go 编译，零 CGO 依赖
-- Windows PowerShell 可用于发布构建脚本
+- PowerShell 可用于发布构建脚本
 
 ## 快速开始
 
@@ -50,9 +50,9 @@ go build -o lin_simulator .
 simulator.db -> 内存 PortMap -> TCP 监听端口 -> 客户端
 ```
 
-1. 启动时读取 SQLite 中的 `ports` 和 `commands`。
+1. 启动时读取 SQLite 中的 `ports` 和 `commands`，只监听至少包含一条命令的有效端口。
 2. 加载阶段校验端口延迟、命令编码、返回值编码和命令长度。
-3. 运行阶段按 TCP 字节流缓冲匹配命令，支持拆包、粘包和垃圾字节后的自动重同步。
+3. 运行阶段沿命令 Trie 匹配 TCP 字节流，支持拆包、粘包和垃圾字节后的自动重同步。
 4. 同一命令存在多条返回值时，每个 TCP 连接独立轮转返回。
 
 ### 命令匹配流程
@@ -64,7 +64,7 @@ simulator.db -> 内存 PortMap -> TCP 监听端口 -> 客户端
 连接缓冲区累积字节
     |
     v
-按已知命令做最长前缀匹配
+沿命令 Trie 做最长前缀匹配
     |
     +-- 匹配 -> 按轮转顺序选取预解码返回值 -> 延迟发送
     |
@@ -77,7 +77,7 @@ simulator.db -> 内存 PortMap -> TCP 监听端口 -> 客户端
 
 ```text
 lin_simulator/
-|-- build.ps1            # Windows 发布构建脚本，输出多平台主程序和 simulator.db
+|-- build.ps1            # PowerShell 发布构建脚本，输出多平台主程序和 simulator.db
 |-- main.go              # 入口：参数解析、日志初始化、数据库加载、启动服务
 |-- database.go          # SQLite 数据加载
 |-- database_test.go     # 数据加载和数据校验测试
@@ -105,7 +105,7 @@ lin_simulator/
 |----|------|------|
 | `port_id` | INTEGER | 端口 ID（主键） |
 | `ip` | TEXT | 演示快照来源字段；运行时不用于筛选，公开快照统一为 `127.0.0.1` |
-| `port` | INTEGER | TCP 端口号；运行时只加载 `1..65535` |
+| `port` | INTEGER | TCP 端口号；运行时只加载 `1..65535` 且至少包含一条命令的端口 |
 | `delay` | INTEGER | 端口级延迟（毫秒） |
 
 **commands** - 预编码命令和返回值映射
@@ -114,8 +114,8 @@ lin_simulator/
 |----|------|------|
 | `id` | INTEGER | 自增主键 |
 | `port_id` | INTEGER | 关联端口 |
-| `command_key` | TEXT | 大写十六进制命令 |
-| `return_value` | TEXT | 大写十六进制返回值 |
+| `command_key` | TEXT | 十六进制命令，大小写均可，不能为空 |
+| `return_value` | TEXT | 十六进制返回值，大小写均可，不能为空 |
 | `seq` | INTEGER | 同命令返回值序号 |
 
 ## 运维
@@ -126,7 +126,7 @@ lin_simulator/
 .\build.ps1
 ```
 
-脚本在 Windows 下执行，默认交叉编译 8 个平台主程序，并把产物和 `simulator.db` 直接输出到 `C:\source\01_project\linlin_pub\dist\`。可通过 `-DistDir` 覆盖输出目录。
+脚本可从任意目录执行，默认交叉编译 8 个平台主程序，并把产物和 `simulator.db` 直接输出到项目根目录的 `dist\`。该目录已由 `.gitignore` 排除。可通过 `-DistDir` 覆盖输出目录，通过 `-Clean` 清理旧产物后重新构建。
 
 ### 本地检查
 

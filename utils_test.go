@@ -5,6 +5,25 @@ import (
 	"testing"
 )
 
+func TestBytesToHexUsesUppercaseEncoding(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []byte
+		want string
+	}{
+		{name: "empty", in: nil, want: ""},
+		{name: "bytes", in: []byte{0x00, 0x0A, 0xBF, 0xFF}, want: "000ABFFF"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := BytesToHex(tt.in); got != tt.want {
+				t.Fatalf("BytesToHex(% X) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSelectLocalIPv4SkipsLocalAndVirtualCandidates(t *testing.T) {
 	hardwareAddr := net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}
 	flags := net.FlagUp | net.FlagBroadcast | net.FlagMulticast

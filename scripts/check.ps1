@@ -12,26 +12,43 @@ $modules = @(
     @{ Name = "lin_simulator"; Path = $repoRoot; BuildOut = Join-Path $buildDir "lin_simulator.exe" }
 )
 
-foreach ($module in $modules) {
-    Write-Host "== $($module.Name): test =="
-    Push-Location $module.Path
-    try {
-        go test ./...
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Label,
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Command
+    )
 
-        Write-Host "== $($module.Name): vet =="
-        go vet ./...
-
-        Write-Host "== $($module.Name): build =="
-        go build -o $module.BuildOut .
-
-        if (-not $SkipVulnCheck) {
-            Write-Host "== $($module.Name): govulncheck =="
-            go run golang.org/x/vuln/cmd/govulncheck@latest ./...
-        }
-    }
-    finally {
-        Pop-Location
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Label failed with exit code $LASTEXITCODE"
     }
 }
 
-Remove-Item -LiteralPath $buildDir -Recurse -Force -ErrorAction SilentlyContinue
+try {
+    foreach ($module in $modules) {
+        Write-Host "== $($module.Name): test =="
+        Push-Location $module.Path
+        try {
+            Invoke-Native "go test" { go test ./... }
+
+            Write-Host "== $($module.Name): vet =="
+            Invoke-Native "go vet" { go vet ./... }
+
+            Write-Host "== $($module.Name): build =="
+            Invoke-Native "go build" { go build -o $module.BuildOut . }
+
+            if (-not $SkipVulnCheck) {
+                Write-Host "== $($module.Name): govulncheck =="
+                Invoke-Native "govulncheck" { go run golang.org/x/vuln/cmd/govulncheck@latest ./... }
+            }
+        }
+        finally {
+            Pop-Location
+        }
+    }
+}
+finally {
+    Remove-Item -LiteralPath $buildDir -Recurse -Force -ErrorAction SilentlyContinue
+}

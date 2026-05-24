@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -13,6 +12,33 @@ type localIPCandidate struct {
 	flags        net.Flags
 	hardwareAddr net.HardwareAddr
 	ip           net.IP
+}
+
+var virtualInterfaceNameParts = [...]string{
+	"loopback",
+	"virtual",
+	"virtualbox",
+	"vbox",
+	"vmware",
+	"hyper-v",
+	"vethernet",
+	"docker",
+	"wsl",
+	"npcap",
+	"bluetooth",
+	"teredo",
+	"isatap",
+	"tunnel",
+	"tap",
+	"tun",
+	"tailscale",
+	"zerotier",
+	"wireguard",
+	"openvpn",
+	"hamachi",
+	"utun",
+	"bridge",
+	"br-",
 }
 
 // getLocalIP 自动选择可用于监听的真实网卡 IPv4 地址。
@@ -153,33 +179,7 @@ func isUsableIPv4(ip net.IP) bool {
 
 func isLikelyVirtualInterface(name string) bool {
 	normalized := strings.ToLower(strings.ReplaceAll(name, " ", ""))
-	virtualNameParts := []string{
-		"loopback",
-		"virtual",
-		"virtualbox",
-		"vbox",
-		"vmware",
-		"hyper-v",
-		"vethernet",
-		"docker",
-		"wsl",
-		"npcap",
-		"bluetooth",
-		"teredo",
-		"isatap",
-		"tunnel",
-		"tap",
-		"tun",
-		"tailscale",
-		"zerotier",
-		"wireguard",
-		"openvpn",
-		"hamachi",
-		"utun",
-		"bridge",
-		"br-",
-	}
-	for _, part := range virtualNameParts {
+	for _, part := range virtualInterfaceNameParts {
 		if strings.Contains(normalized, part) {
 			return true
 		}
@@ -189,5 +189,11 @@ func isLikelyVirtualInterface(name string) bool {
 
 // BytesToHex 字节转大写 hex 字符串
 func BytesToHex(b []byte) string {
-	return strings.ToUpper(hex.EncodeToString(b))
+	const table = "0123456789ABCDEF"
+	dst := make([]byte, len(b)*2)
+	for i, v := range b {
+		dst[i*2] = table[v>>4]
+		dst[i*2+1] = table[v&0x0F]
+	}
+	return string(dst)
 }

@@ -18,6 +18,12 @@ const (
 	maxPendingBytes     = maxCommandBytes
 )
 
+const (
+	portStatusStopped = iota
+	portStatusListening
+	portStatusRetry
+)
+
 // setPortStatus 更新端口状态及重试信息。
 func setPortStatus(p *PortInfo, status int, failCount int, nextRetry time.Time) {
 	p.statusMu.Lock()
@@ -36,7 +42,7 @@ func portStatusSnapshot(p *PortInfo) (int, int, time.Time) {
 func setPortRetry(p *PortInfo) {
 	_, failCount, _ := portStatusSnapshot(p)
 	backoff := retryBackoff(failCount)
-	setPortStatus(p, 2, failCount+1, time.Now().Add(backoff))
+	setPortStatus(p, portStatusRetry, failCount+1, time.Now().Add(backoff))
 }
 
 func retryBackoff(failCount int) time.Duration {
@@ -47,7 +53,7 @@ func retryBackoff(failCount int) time.Duration {
 }
 
 // Start 主循环：首次立即并发启动所有端口，后续定时重试失败端口（指数退避）
-func Start(ctx context.Context, pm map[int64]*PortInfo, globalDelay int, maxConn int) {
+func Start(ctx context.Context, pm map[int]*PortInfo, globalDelay int, maxConn int) {
 	var serverWG sync.WaitGroup
 	startServer := func(p *PortInfo) {
 		select {
@@ -82,13 +88,13 @@ func Start(ctx context.Context, pm map[int64]*PortInfo, globalDelay int, maxConn
 			var retryPorts []*PortInfo
 			for _, p := range pm {
 				status, _, nextRetry := portStatusSnapshot(p)
-				if status == 2 && now.After(nextRetry) {
+				if status == portStatusRetry && now.After(nextRetry) {
 					retryPorts = append(retryPorts, p)
 				}
 			}
 			for _, p := range retryPorts {
 				_, failCount, nextRetry := portStatusSnapshot(p)
-				setPortStatus(p, 0, failCount, nextRetry)
+				setPortStatus(p, portStatusStopped, failCount, nextRetry)
 				startServer(p)
 			}
 		case <-rejectionTicker.C:
@@ -106,7 +112,7 @@ func BuildServer(ctx context.Context, port *PortInfo, globalDelay int, maxConn i
 		return
 	}
 	defer listener.Close()
-	setPortStatus(port, 1, 0, time.Time{})
+	setPortStatus(port, portStatusListening, 0, time.Time{})
 
 	slog.Info("端口监听已启动", "addr", port.Addr)
 
@@ -166,7 +172,7 @@ func releaseConn(port *PortInfo) {
 	port.activeConns.Add(-1)
 }
 
-func logRejectedConnections(pm map[int64]*PortInfo) {
+func logRejectedConnections(pm map[int]*PortInfo) {
 	for _, p := range pm {
 		count := p.rejectedConns.Swap(0)
 		if count > 0 {
@@ -190,22 +196,27 @@ func handleConn(ctx context.Context, conn net.Conn, port *PortInfo, globalDelay 
 		return
 	}
 
-	// 每连接独立的轮转索引：值为"下次使用的索引"。
-	cmdIdx := make(map[string]int, len(port.Commands))
+	state := connState{}
+	responseDelay := responseDelayFor(port, globalDelay)
+	debugLog := slog.Default().Enabled(ctx, slog.LevelDebug)
 
-	slog.Info("客户端已连接", "addr", port.Addr, "remote", conn.RemoteAddr().String())
+	if debugLog {
+		slog.Debug("客户端已连接", "addr", port.Addr, "remote", conn.RemoteAddr().String())
+	}
 
 	buf := make([]byte, readBufferSize)
-	pending := make([]byte, 0, port.MaxCommandLen)
+	pending := make([]byte, 0, initialPendingCapacity(port.MaxCommandLen))
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				slog.Debug("客户端正常断开", "remote", conn.RemoteAddr().String())
-			} else if errors.Is(err, net.ErrClosed) {
-				// 连接已关闭
-			} else {
-				slog.Debug("读取错误", "remote", conn.RemoteAddr().String(), "error", err)
+			if debugLog {
+				if errors.Is(err, io.EOF) {
+					slog.Debug("客户端正常断开", "remote", conn.RemoteAddr().String())
+				} else if errors.Is(err, net.ErrClosed) {
+					// 连接已关闭
+				} else {
+					slog.Debug("读取错误", "remote", conn.RemoteAddr().String(), "error", err)
+				}
 			}
 			return
 		}
@@ -218,7 +229,7 @@ func handleConn(ctx context.Context, conn net.Conn, port *PortInfo, globalDelay 
 
 		pending = append(pending, buf[:n]...)
 		var ok bool
-		pending, ok = processBufferedCommands(ctx, conn, port, globalDelay, pending, cmdIdx)
+		pending, ok = processBufferedCommands(ctx, conn, port, responseDelay, pending, &state, debugLog)
 		if !ok {
 			return
 		}
@@ -230,36 +241,68 @@ func handleConn(ctx context.Context, conn net.Conn, port *PortInfo, globalDelay 
 	}
 }
 
-func processBufferedCommands(ctx context.Context, conn net.Conn, port *PortInfo, globalDelay int, pending []byte, cmdIdx map[string]int) ([]byte, bool) {
-	for len(pending) > 0 {
-		cmd, cmdLen, cmdKey := longestCommandMatch(port, pending)
-		if cmd != nil {
-			idx := cmdIdx[cmdKey]
-			response := cmd.Responses[idx]
-			cmdIdx[cmdKey] = (idx + 1) % len(cmd.Responses)
+type connState struct {
+	responseIndex map[*CommandInfo]int
+}
 
-			if !waitResponseDelay(ctx, port, globalDelay) {
-				return pending, false
+func (s *connState) nextResponse(cmd *CommandInfo) []byte {
+	if len(cmd.Responses) == 1 {
+		return cmd.Responses[0]
+	}
+	if s.responseIndex == nil {
+		s.responseIndex = make(map[*CommandInfo]int)
+	}
+	idx := s.responseIndex[cmd]
+	s.responseIndex[cmd] = (idx + 1) % len(cmd.Responses)
+	return cmd.Responses[idx]
+}
+
+func processBufferedCommands(ctx context.Context, conn net.Conn, port *PortInfo, responseDelay time.Duration, pending []byte, state *connState, debugLog bool) ([]byte, bool) {
+	for consumed := 0; consumed < len(pending); {
+		input := pending[consumed:]
+		cmd, cmdLen, prefix := matchCommand(port, input)
+		if cmd != nil {
+			response := state.nextResponse(cmd)
+
+			if !waitResponseDelay(ctx, responseDelay) {
+				return input, false
 			}
 			if err := writeAll(conn, response); err != nil {
-				slog.Debug("写入失败", "addr", port.Addr, "cmd", cmd.HexKey, "error", err)
-				return pending, false
+				if debugLog {
+					slog.Debug("写入失败", "addr", port.Addr, "cmd", cmd.HexKey, "error", err)
+				}
+				return input, false
 			}
-			pending = pending[cmdLen:]
+			consumed += cmdLen
 			continue
 		}
 
-		if isCommandPrefix(port, pending) {
-			return pending, true
+		if prefix {
+			if consumed == 0 {
+				return pending, true
+			}
+			copy(pending, input)
+			return pending[:len(input)], true
 		}
 
-		slog.Debug("未匹配命令字节，丢弃并继续同步", "addr", port.Addr, "byte", BytesToHex(pending[:1]))
-		pending = pending[1:]
+		if debugLog {
+			slog.Debug("未匹配命令字节，丢弃并继续同步", "addr", port.Addr, "byte", BytesToHex(input[:1]))
+		}
+		consumed++
 	}
-	return pending, true
+	return pending[:0], true
 }
 
-func longestCommandMatch(port *PortInfo, pending []byte) (*CommandInfo, int, string) {
+func matchCommand(port *PortInfo, pending []byte) (*CommandInfo, int, bool) {
+	if len(pending) == 0 {
+		return nil, 0, true
+	}
+
+	node := port.commandRoot
+	if node == nil {
+		return nil, 0, false
+	}
+
 	maxLen := len(pending)
 	if port.MaxCommandLen > 0 && maxLen > port.MaxCommandLen {
 		maxLen = port.MaxCommandLen
@@ -268,52 +311,48 @@ func longestCommandMatch(port *PortInfo, pending []byte) (*CommandInfo, int, str
 	var (
 		match    *CommandInfo
 		matchLen int
-		matchKey string
 	)
-	for _, length := range port.CommandLengths {
-		if length > maxLen {
-			continue
+	for i := 0; i < maxLen; i++ {
+		if len(node.children) == 0 {
+			return match, matchLen, false
 		}
-		key := string(pending[:length])
-		cmd, ok := port.Commands[key]
-		if !ok || len(cmd.Responses) == 0 {
-			continue
+		next := node.children[pending[i]]
+		if next == nil {
+			return match, matchLen, false
 		}
-		if length < matchLen {
-			continue
+		node = next
+		if node.command != nil && len(node.command.Responses) > 0 {
+			match = node.command
+			matchLen = i + 1
 		}
-		match = cmd
-		matchLen = length
-		matchKey = key
 	}
-	return match, matchLen, matchKey
+	return match, matchLen, len(pending) <= port.MaxCommandLen
 }
 
-func isCommandPrefix(port *PortInfo, pending []byte) bool {
-	if len(pending) == 0 {
-		return true
-	}
-	if port.MaxCommandLen > 0 && len(pending) > port.MaxCommandLen {
-		return false
-	}
-	key := string(pending)
-	if _, ok := port.Commands[key]; ok {
-		return true
-	}
-	_, ok := port.CommandPrefix[key]
-	return ok
-}
-
-func waitResponseDelay(ctx context.Context, port *PortInfo, globalDelay int) bool {
+func responseDelayFor(port *PortInfo, globalDelay int) time.Duration {
 	d := globalDelay
 	if port.Delay > 0 {
 		d = port.Delay
 	}
 	if d <= 0 {
+		return 0
+	}
+	return time.Duration(d) * time.Millisecond
+}
+
+func initialPendingCapacity(maxCommandLen int) int {
+	if maxCommandLen <= 0 || maxCommandLen > readBufferSize {
+		return readBufferSize
+	}
+	return maxCommandLen
+}
+
+func waitResponseDelay(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
 		return true
 	}
 
-	timer := time.NewTimer(time.Duration(d) * time.Millisecond)
+	timer := time.NewTimer(d)
 	defer timer.Stop()
 
 	select {
@@ -345,11 +384,11 @@ func writeAll(conn net.Conn, data []byte) error {
 }
 
 func compactPending(pending []byte) []byte {
-	if len(pending) == 0 {
-		return nil
-	}
 	if cap(pending) <= maxPendingBytes {
 		return pending
+	}
+	if len(pending) == 0 {
+		return make([]byte, 0, readBufferSize)
 	}
 	newCap := max(len(pending)*2, len(pending)+readBufferSize)
 	newCap = min(newCap, maxPendingBytes)

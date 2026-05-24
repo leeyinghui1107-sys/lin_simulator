@@ -97,23 +97,25 @@ func main() {
 		slog.Error("数据库打开失败", "error", err)
 		os.Exit(1)
 	}
-	defer db.Close()
 
 	// 6. 加载 PortMap
 	pm, err := LoadPortMap(db, bindHost)
 	if err != nil {
+		closeDatabase(db)
 		slog.Error("数据加载失败", "error", err)
 		os.Exit(1)
 	}
 	if len(pm) == 0 {
 		summaries, summaryErr := LoadPortSummaries(db)
+		closeDatabase(db)
 		if summaryErr != nil {
-			slog.Error("没有需要模拟的端口", "ip", localIP, "available_port_error", summaryErr)
+			slog.Error("没有可模拟的端口命令", "ip", localIP, "available_port_error", summaryErr)
 		} else {
-			slog.Error("没有需要模拟的端口", "ip", localIP, "available_ports", summaries)
+			slog.Error("没有可模拟的端口命令", "ip", localIP, "available_ports", summaries)
 		}
 		os.Exit(1)
 	}
+	closeDatabase(db)
 	logMergedPortRecords(pm)
 
 	// 7. 优雅关闭
@@ -125,7 +127,13 @@ func main() {
 	slog.Info("设备模拟器已退出")
 }
 
-func logMergedPortRecords(pm map[int64]*PortInfo) {
+func closeDatabase(db *sql.DB) {
+	if err := db.Close(); err != nil {
+		slog.Warn("数据库关闭失败", "error", err)
+	}
+}
+
+func logMergedPortRecords(pm map[int]*PortInfo) {
 	for _, p := range pm {
 		if len(p.MergedRecords) == 0 {
 			continue

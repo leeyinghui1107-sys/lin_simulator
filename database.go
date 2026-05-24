@@ -13,7 +13,7 @@ type PortSummary struct {
 }
 
 // LoadPortMap 从 SQLite 加载端口配置及命令映射到内存
-func LoadPortMap(db *sql.DB, bindHost string) (map[int64]*PortInfo, error) {
+func LoadPortMap(db *sql.DB, bindHost string) (map[int]*PortInfo, error) {
 	// 查询1：加载全部有效端口，监听地址统一绑定到启动参数决定的地址。
 	portRows, err := db.Query(
 		"SELECT port_id, port, delay FROM ports WHERE port BETWEEN 1 AND 65535 ORDER BY port, port_id",
@@ -23,7 +23,7 @@ func LoadPortMap(db *sql.DB, bindHost string) (map[int64]*PortInfo, error) {
 	}
 	defer portRows.Close()
 
-	pm := make(map[int64]*PortInfo)
+	pm := make(map[int]*PortInfo)
 	for portRows.Next() {
 		var portID int64
 		var port int
@@ -34,17 +34,15 @@ func LoadPortMap(db *sql.DB, bindHost string) (map[int64]*PortInfo, error) {
 		if delay < 0 {
 			return nil, fmt.Errorf("端口 %d(port_id=%d) 的 delay 不能为负数: %d", port, portID, delay)
 		}
-		key := int64(port)
+		key := port
 		if existing, ok := pm[key]; ok {
 			existing.MergedRecords = append(existing.MergedRecords, MergedPortRecord{PortID: portID, Delay: delay})
 			continue
 		}
 		pm[key] = &PortInfo{
-			PortID:        portID,
-			Addr:          fmt.Sprintf("%s:%d", bindHost, port),
-			Delay:         delay,
-			Commands:      make(map[string]*CommandInfo),
-			CommandPrefix: make(map[string]struct{}),
+			PortID: portID,
+			Addr:   fmt.Sprintf("%s:%d", bindHost, port),
+			Delay:  delay,
 		}
 	}
 	if err := portRows.Err(); err != nil {
@@ -57,7 +55,7 @@ func LoadPortMap(db *sql.DB, bindHost string) (map[int64]*PortInfo, error) {
 
 	// 查询2：按端口号加载命令；同一端口号的多条旧 IP 记录合并到一个本地监听端口。
 	cmdRows, err := db.Query(
-		`SELECT p.port, c.command_key, c.return_value, c.seq
+		`SELECT p.port, c.command_key, c.return_value
 		 FROM commands c
 		 JOIN ports p ON c.port_id = p.port_id
 		 WHERE p.port BETWEEN 1 AND 65535
@@ -71,22 +69,18 @@ func LoadPortMap(db *sql.DB, bindHost string) (map[int64]*PortInfo, error) {
 	for cmdRows.Next() {
 		var port int
 		var cmdKey, retVal string
-		var seq int
-		if err := cmdRows.Scan(&port, &cmdKey, &retVal, &seq); err != nil {
+		if err := cmdRows.Scan(&port, &cmdKey, &retVal); err != nil {
 			return nil, fmt.Errorf("扫描命令行失败: %w", err)
 		}
-		if p, ok := pm[int64(port)]; ok {
-			command, normalizedCmdKey, err := decodeHexField("command_key", cmdKey)
+		if p, ok := pm[port]; ok {
+			command, normalizedCmdKey, err := decodeCommandHex(cmdKey)
 			if err != nil {
 				return nil, fmt.Errorf("端口 %d 的命令编码无效: %w", port, err)
-			}
-			if len(command) == 0 {
-				return nil, fmt.Errorf("端口 %d 的命令编码为空", port)
 			}
 			if len(command) > maxCommandBytes {
 				return nil, fmt.Errorf("端口 %d 命令 %s 过长: %d 字节，最大 %d 字节", port, normalizedCmdKey, len(command), maxCommandBytes)
 			}
-			response, _, err := decodeHexField("return_value", retVal)
+			response, err := decodeHexBytes("return_value", retVal)
 			if err != nil {
 				return nil, fmt.Errorf("端口 %d 命令 %s 的返回值编码无效: %w", port, normalizedCmdKey, err)
 			}
@@ -97,22 +91,45 @@ func LoadPortMap(db *sql.DB, bindHost string) (map[int64]*PortInfo, error) {
 		return nil, fmt.Errorf("遍历命令行失败: %w", err)
 	}
 
+	for port, p := range pm {
+		if p.CommandCount == 0 {
+			delete(pm, port)
+		}
+	}
+
 	return pm, nil
 }
 
-func decodeHexField(field string, value string) ([]byte, string, error) {
-	normalized := strings.ToUpper(strings.TrimSpace(value))
-	if normalized == "" {
-		return nil, normalized, fmt.Errorf("%s 不能为空", field)
+func decodeCommandHex(value string) ([]byte, string, error) {
+	trimmed, err := trimHexField("command_key", value)
+	if err != nil {
+		return nil, "", err
 	}
-	if len(normalized)%2 != 0 {
-		return nil, normalized, fmt.Errorf("%s 长度必须为偶数", field)
-	}
-	data, err := hex.DecodeString(normalized)
+	normalized := strings.ToUpper(trimmed)
+	data, err := hex.DecodeString(trimmed)
 	if err != nil {
 		return nil, normalized, err
 	}
 	return data, normalized, nil
+}
+
+func decodeHexBytes(field string, value string) ([]byte, error) {
+	trimmed, err := trimHexField(field, value)
+	if err != nil {
+		return nil, err
+	}
+	return hex.DecodeString(trimmed)
+}
+
+func trimHexField(field string, value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", fmt.Errorf("%s 不能为空", field)
+	}
+	if len(trimmed)%2 != 0 {
+		return "", fmt.Errorf("%s 长度必须为偶数", field)
+	}
+	return trimmed, nil
 }
 
 func LoadPortSummaries(db *sql.DB) ([]PortSummary, error) {

@@ -49,7 +49,7 @@ func TestLogRejectedConnectionsResetsCounters(t *testing.T) {
 	port := &PortInfo{Addr: "0.0.0.0:4001"}
 	port.rejectedConns.Add(3)
 
-	logRejectedConnections(map[int64]*PortInfo{4001: port})
+	logRejectedConnections(map[int]*PortInfo{4001: port})
 
 	if got := port.rejectedConns.Load(); got != 0 {
 		t.Fatalf("rejectedConns = %d, want 0", got)
@@ -194,11 +194,11 @@ func TestProcessBufferedCommandsRecoversAfterLargeGarbagePrefix(t *testing.T) {
 	port := &PortInfo{Addr: "pipe"}
 	port.addCommandResponse([]byte{0xAA, 0xBB}, "AABB", []byte{0x01})
 	conn := &recordingConn{}
-	cmdIdx := make(map[string]int)
+	state := connState{}
 	pending := bytes.Repeat([]byte{0x00}, readBufferSize*2)
 	pending = append(pending, 0xAA, 0xBB)
 
-	remaining, ok := processBufferedCommands(context.Background(), conn, port, 0, pending, cmdIdx)
+	remaining, ok := processBufferedCommands(context.Background(), conn, port, 0, pending, &state, false)
 	if !ok {
 		t.Fatal("processBufferedCommands returned false")
 	}
@@ -210,32 +210,120 @@ func TestProcessBufferedCommandsRecoversAfterLargeGarbagePrefix(t *testing.T) {
 	}
 }
 
-func TestLongestCommandMatchPrefersLongestKnownCommand(t *testing.T) {
+func TestProcessBufferedCommandsReusesConsumedBuffer(t *testing.T) {
+	port := &PortInfo{Addr: "pipe"}
+	port.addCommandResponse([]byte{0xAA}, "AA", []byte{0x01})
+	conn := &recordingConn{}
+	state := connState{}
+	pending := make([]byte, 1, readBufferSize)
+	pending[0] = 0xAA
+
+	remaining, ok := processBufferedCommands(context.Background(), conn, port, 0, pending, &state, false)
+	if !ok {
+		t.Fatal("processBufferedCommands returned false")
+	}
+	if len(remaining) != 0 || cap(remaining) != readBufferSize {
+		t.Fatalf("remaining = len %d cap %d, want len 0 cap %d", len(remaining), cap(remaining), readBufferSize)
+	}
+}
+
+func TestProcessBufferedCommandsCompactsTrailingPrefix(t *testing.T) {
+	port := &PortInfo{Addr: "pipe"}
+	port.addCommandResponse([]byte{0xAA, 0xBB}, "AABB", []byte{0x01})
+	conn := &recordingConn{}
+	state := connState{}
+	pending := make([]byte, 2, readBufferSize)
+	copy(pending, []byte{0x00, 0xAA})
+
+	remaining, ok := processBufferedCommands(context.Background(), conn, port, 0, pending, &state, false)
+	if !ok {
+		t.Fatal("processBufferedCommands returned false")
+	}
+	if !bytes.Equal(remaining, []byte{0xAA}) || cap(remaining) != readBufferSize {
+		t.Fatalf("remaining = % X cap %d, want AA cap %d", remaining, cap(remaining), readBufferSize)
+	}
+
+	remaining = append(remaining, 0xBB)
+	remaining, ok = processBufferedCommands(context.Background(), conn, port, 0, remaining, &state, false)
+	if !ok || len(remaining) != 0 || !bytes.Equal(conn.buf.Bytes(), []byte{0x01}) {
+		t.Fatalf("completed prefix = remaining % X written % X ok %v, want empty, 01, true", remaining, conn.buf.Bytes(), ok)
+	}
+}
+
+func TestMatchCommandPrefersLongestKnownCommand(t *testing.T) {
 	port := &PortInfo{Addr: "pipe"}
 	port.addCommandResponse([]byte{0xAA, 0xBB}, "AABB", []byte{0x02})
 	port.addCommandResponse([]byte{0xAA}, "AA", []byte{0x01})
 
-	cmd, cmdLen, _ := longestCommandMatch(port, []byte{0xAA, 0xBB})
+	cmd, cmdLen, _ := matchCommand(port, []byte{0xAA, 0xBB})
 	if cmd == nil {
-		t.Fatal("longestCommandMatch returned nil")
+		t.Fatal("matchCommand returned nil")
 	}
 	if cmdLen != 2 || cmd.HexKey != "AABB" {
 		t.Fatalf("matched %s length %d, want AABB length 2", cmd.HexKey, cmdLen)
 	}
 }
 
-func TestIsCommandPrefixUsesCompleteCommandsAndPrefixes(t *testing.T) {
+func TestMatchCommandReportsCompleteCommandsAndPrefixes(t *testing.T) {
 	port := &PortInfo{Addr: "pipe"}
 	port.addCommandResponse([]byte{0xAA, 0xBB}, "AABB", []byte{0x01})
 
-	if !isCommandPrefix(port, []byte{0xAA}) {
-		t.Fatal("isCommandPrefix rejected a valid command prefix")
+	if cmd, _, prefix := matchCommand(port, []byte{0xAA}); cmd != nil || !prefix {
+		t.Fatal("matchCommand rejected a valid command prefix")
 	}
-	if !isCommandPrefix(port, []byte{0xAA, 0xBB}) {
-		t.Fatal("isCommandPrefix rejected a complete command")
+	if cmd, _, _ := matchCommand(port, []byte{0xAA, 0xBB}); cmd == nil {
+		t.Fatal("matchCommand rejected a complete command")
 	}
-	if isCommandPrefix(port, []byte{0xAA, 0xBC}) {
-		t.Fatal("isCommandPrefix accepted an invalid prefix")
+	if cmd, _, prefix := matchCommand(port, []byte{0xAA, 0xBC}); cmd != nil || prefix {
+		t.Fatal("matchCommand accepted an invalid prefix")
+	}
+}
+
+func TestConnStateNextResponseRotatesOnlyMultiResponseCommands(t *testing.T) {
+	state := connState{}
+	cmd := &CommandInfo{
+		Responses: [][]byte{
+			{0x01},
+			{0x02},
+			{0x03},
+		},
+	}
+
+	for i, want := range [][]byte{{0x01}, {0x02}, {0x03}, {0x01}, {0x02}} {
+		if got := state.nextResponse(cmd); !bytes.Equal(got, want) {
+			t.Fatalf("response %d = % X, want % X", i, got, want)
+		}
+	}
+	if state.responseIndex[cmd] != 2 {
+		t.Fatalf("next response index = %d, want 2", state.responseIndex[cmd])
+	}
+
+	singleState := connState{}
+	single := &CommandInfo{Responses: [][]byte{{0xAA}}}
+	if got := singleState.nextResponse(single); !bytes.Equal(got, []byte{0xAA}) {
+		t.Fatalf("single response = % X, want AA", got)
+	}
+	if singleState.responseIndex != nil {
+		t.Fatal("single-response command allocated responseIndex")
+	}
+
+	independentState := connState{}
+	cmdA := &CommandInfo{HexKey: "AA", Responses: [][]byte{{0x10}, {0x11}}}
+	cmdB := &CommandInfo{HexKey: "BB", Responses: [][]byte{{0x20}, {0x21}, {0x22}}}
+	sequence := []struct {
+		cmd  *CommandInfo
+		want []byte
+	}{
+		{cmd: cmdA, want: []byte{0x10}},
+		{cmd: cmdB, want: []byte{0x20}},
+		{cmd: cmdA, want: []byte{0x11}},
+		{cmd: cmdB, want: []byte{0x21}},
+		{cmd: cmdA, want: []byte{0x10}},
+	}
+	for i, step := range sequence {
+		if got := independentState.nextResponse(step.cmd); !bytes.Equal(got, step.want) {
+			t.Fatalf("independent response %d = % X, want % X", i, got, step.want)
+		}
 	}
 }
 
@@ -265,8 +353,8 @@ func TestSetPortRetryIncrementsFailCountWithStatusSnapshot(t *testing.T) {
 
 	setPortRetry(port)
 	status, failCount, nextRetry := portStatusSnapshot(port)
-	if status != 2 {
-		t.Fatalf("status = %d, want 2", status)
+	if status != portStatusRetry {
+		t.Fatalf("status = %d, want %d", status, portStatusRetry)
 	}
 	if failCount != 1 {
 		t.Fatalf("failCount = %d, want 1", failCount)
@@ -275,16 +363,16 @@ func TestSetPortRetryIncrementsFailCountWithStatusSnapshot(t *testing.T) {
 		t.Fatal("nextRetry was not set")
 	}
 
-	setPortStatus(port, 1, 0, time.Time{})
+	setPortStatus(port, portStatusListening, 0, time.Time{})
 	status, failCount, nextRetry = portStatusSnapshot(port)
-	if status != 1 || failCount != 0 || !nextRetry.IsZero() {
+	if status != portStatusListening || failCount != 0 || !nextRetry.IsZero() {
 		t.Fatalf("snapshot after reset = status:%d failCount:%d nextRetry:%s, want normal zero retry", status, failCount, nextRetry)
 	}
 }
 
 func TestWaitResponseDelayHonorsPortDelayAndContext(t *testing.T) {
 	start := time.Now()
-	if !waitResponseDelay(context.Background(), &PortInfo{Delay: 20}, 0) {
+	if !waitResponseDelay(context.Background(), 20*time.Millisecond) {
 		t.Fatal("waitResponseDelay returned false without cancellation")
 	}
 	if elapsed := time.Since(start); elapsed < 15*time.Millisecond {
@@ -293,11 +381,11 @@ func TestWaitResponseDelayHonorsPortDelayAndContext(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if waitResponseDelay(ctx, &PortInfo{Delay: 20}, 0) {
+	if waitResponseDelay(ctx, 20*time.Millisecond) {
 		t.Fatal("waitResponseDelay returned true after context cancellation")
 	}
 
-	if !waitResponseDelay(context.Background(), &PortInfo{Delay: -1}, 0) {
+	if !waitResponseDelay(context.Background(), 0) {
 		t.Fatal("waitResponseDelay returned false for non-positive delay")
 	}
 }
@@ -318,6 +406,11 @@ func TestCompactPendingKeepsAppendHeadroom(t *testing.T) {
 
 	if compacted := compactPending(nil); compacted != nil {
 		t.Fatalf("compactPending(nil) = %v, want nil", compacted)
+	}
+
+	reusable := make([]byte, 0, readBufferSize)
+	if compacted := compactPending(reusable); cap(compacted) != readBufferSize {
+		t.Fatalf("cap(compactPending(reusable)) = %d, want %d", cap(compacted), readBufferSize)
 	}
 }
 
@@ -352,8 +445,8 @@ func TestBuildServerMarksPortForRetryWhenListenFails(t *testing.T) {
 	BuildServer(context.Background(), port, 0, 1)
 
 	status, failCount, nextRetry := portStatusSnapshot(port)
-	if status != 2 {
-		t.Fatalf("status = %d, want 2", status)
+	if status != portStatusRetry {
+		t.Fatalf("status = %d, want %d", status, portStatusRetry)
 	}
 	if failCount != 1 {
 		t.Fatalf("failCount = %d, want 1", failCount)
@@ -414,4 +507,91 @@ func (a testAddr) Network() string {
 
 func (a testAddr) String() string {
 	return string(a)
+}
+
+var (
+	benchmarkMatchedCommand *CommandInfo
+	benchmarkMatchedLen     int
+	benchmarkMatchedPrefix  bool
+)
+
+func BenchmarkMatchCommand(b *testing.B) {
+	cases := []struct {
+		name       string
+		add        func(*PortInfo)
+		pending    []byte
+		wantHexKey string
+		wantLen    int
+		wantPrefix bool
+	}{
+		{
+			name: "longest",
+			add: func(port *PortInfo) {
+				port.addCommandResponse([]byte{0xAA}, "AA", []byte{0x01})
+				port.addCommandResponse([]byte{0xAA, 0xBB}, "AABB", []byte{0x02})
+				port.addCommandResponse([]byte{0xAA, 0xBB, 0xCC, 0xDD}, "AABBCCDD", []byte{0x03})
+				port.addCommandResponse([]byte{0xEE, 0xFF}, "EEFF", []byte{0x04})
+			},
+			pending:    []byte{0xAA, 0xBB, 0xCC, 0xDD},
+			wantHexKey: "AABBCCDD",
+			wantLen:    4,
+			wantPrefix: true,
+		},
+		{
+			name: "root-miss",
+			add: func(port *PortInfo) {
+				port.addCommandResponse([]byte{0xAA, 0xBB}, "AABB", []byte{0x01})
+			},
+			pending: []byte{0x00},
+		},
+		{
+			name: "prefix",
+			add: func(port *PortInfo) {
+				port.addCommandResponse([]byte{0xAA, 0xBB}, "AABB", []byte{0x01})
+			},
+			pending:    []byte{0xAA},
+			wantPrefix: true,
+		},
+		{
+			name: "short-match",
+			add: func(port *PortInfo) {
+				port.addCommandResponse([]byte{0xAA}, "AA", []byte{0x01})
+			},
+			pending:    []byte{0xAA},
+			wantHexKey: "AA",
+			wantLen:    1,
+			wantPrefix: true,
+		},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			port := &PortInfo{Addr: "bench"}
+			tc.add(port)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			var cmd *CommandInfo
+			var cmdLen int
+			var prefix bool
+			for i := 0; i < b.N; i++ {
+				cmd, cmdLen, prefix = matchCommand(port, tc.pending)
+			}
+
+			benchmarkMatchedCommand = cmd
+			benchmarkMatchedLen = cmdLen
+			benchmarkMatchedPrefix = prefix
+
+			if tc.wantHexKey == "" {
+				if cmd != nil || cmdLen != 0 || prefix != tc.wantPrefix {
+					b.Fatalf("matchCommand = (%v, %d, %v), want nil, 0, %v", cmd, cmdLen, prefix, tc.wantPrefix)
+				}
+				return
+			}
+			if cmd == nil || cmd.HexKey != tc.wantHexKey || cmdLen != tc.wantLen || prefix != tc.wantPrefix {
+				b.Fatalf("matchCommand = (%v, %d, %v), want %s, %d, %v", cmd, cmdLen, prefix, tc.wantHexKey, tc.wantLen, tc.wantPrefix)
+			}
+		})
+	}
 }
