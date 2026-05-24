@@ -1,5 +1,5 @@
 # Lin Simulator release build script.
-# Run from anywhere; outputs release binaries and simulator.db into ./dist by default.
+# Run from anywhere; outputs release binaries, simulator.db, and protocol.zip into ./dist by default.
 
 [CmdletBinding()]
 param(
@@ -13,6 +13,8 @@ $ErrorActionPreference = "Stop"
 $BinaryName = "lin_simulator"
 $MainPackage = "."
 $DatabaseFile = "simulator.db"
+$ProtocolDir = "protocol"
+$ProtocolArchive = "protocol.zip"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 if ([System.IO.Path]::IsPathRooted($DistDir)) {
@@ -73,6 +75,7 @@ function Clear-ReleaseOutput {
     }
 
     Remove-Item -LiteralPath (Join-Path $TargetDir $DatabaseFile) -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $TargetDir $ProtocolArchive) -Force -ErrorAction SilentlyContinue
 }
 
 function Invoke-ReleaseBuild {
@@ -104,6 +107,24 @@ function Copy-ReleaseDatabase {
     Write-Host "  Output: $destination" -ForegroundColor Green
 }
 
+function Compress-ReleaseProtocol {
+    $sourceDir = Join-Path $ProjectRoot $ProtocolDir
+    if (-not (Test-Path -LiteralPath $sourceDir -PathType Container)) {
+        throw "Missing protocol directory: $sourceDir"
+    }
+
+    $items = @(Get-ChildItem -LiteralPath $sourceDir -Force)
+    if ($items.Count -eq 0) {
+        throw "Protocol directory is empty: $sourceDir"
+    }
+
+    $destination = Join-Path $TargetDir $ProtocolArchive
+    Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+
+    Compress-Archive -LiteralPath $items.FullName -DestinationPath $destination -Force
+    Write-Host "  Output: $destination" -ForegroundColor Green
+}
+
 function Show-ReleaseOutputs {
     Write-Host ""
     Write-Host "Release output complete:" -ForegroundColor Green
@@ -125,6 +146,16 @@ function Show-ReleaseOutputs {
         $item = Get-Item -LiteralPath $databasePath
         $outputs += [pscustomobject]@{
             Platform = "data"
+            Name = $item.Name
+            SizeMB = [math]::Round($item.Length / 1MB, 2)
+        }
+    }
+
+    $protocolPath = Join-Path $TargetDir $ProtocolArchive
+    if (Test-Path -LiteralPath $protocolPath) {
+        $item = Get-Item -LiteralPath $protocolPath
+        $outputs += [pscustomobject]@{
+            Platform = "protocol"
             Name = $item.Name
             SizeMB = [math]::Round($item.Length / 1MB, 2)
         }
@@ -167,6 +198,7 @@ try {
         }
 
         Copy-ReleaseDatabase
+        Compress-ReleaseProtocol
         Show-ReleaseOutputs
     } finally {
         Pop-Location

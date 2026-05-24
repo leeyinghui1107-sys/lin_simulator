@@ -19,7 +19,9 @@ simulator.db
 | `model.go` | `PortInfo` 状态锁、重试计数、连接计数、命令响应数据和字节 Trie 匹配索引 |
 | `server.go` | TCP 监听、指数退避重试、连接限制、连接处理和优雅关闭 |
 | `utils.go` | 本机 IP 自动识别、`-ip` 校验、字节转十六进制 |
+| `protocol/` | 测试数据库对应的协议资料，发布构建时压缩为 `protocol.zip` |
 | `build.ps1` | PowerShell 多平台发布构建脚本 |
+| `deploy-release.ps1` | PowerShell Release 发布脚本，上传 `dist/` 产物到 GitHub/Gitee |
 
 测试覆盖分布：`database_test.go` 覆盖 SQLite 加载和数据校验，`server_test.go` 覆盖 TCP 流匹配、连接保护和重试状态，`utils_test.go` 覆盖本机 IP 选择和绑定校验。
 
@@ -116,7 +118,7 @@ ORDER BY p.port, c.command_key, c.port_id, c.seq;
 
 ## 7. 发布构建
 
-`build.ps1` 默认交叉编译 8 个平台裸二进制到项目根目录 `dist/`，并复制 `simulator.db`：
+`build.ps1` 默认交叉编译 8 个平台裸二进制到项目根目录 `dist/`，复制 `simulator.db`，并把 `protocol/` 目录内容压缩为 `protocol.zip`：
 
 - `windows/amd64`
 - `windows/arm64`
@@ -127,9 +129,35 @@ ORDER BY p.port, c.command_key, c.port_id, c.seq;
 - `darwin/amd64`
 - `darwin/arm64`
 
-可通过 `-DistDir` 指定输出目录，通过 `-Clean` 清理旧发布产物。
+`protocol.zip` 不保留顶层 `protocol/` 目录，压缩包根目录直接包含协议文件。`protocol/` 缺失或为空时构建失败；`-Clean` 会清理旧二进制、`simulator.db` 和 `protocol.zip`。可通过 `-DistDir` 指定输出目录。
 
-## 8. 当前依赖
+## 8. Release 发布
+
+`deploy-release.ps1` 默认发布 `v0.1.0`，目标为 GitHub `origin` 和 Gitee `gitee`：
+
+- 延续本地部署脚本的路径处理方式，要求 `dist/` 位于项目根目录内，且不能直接指向项目根目录。
+- 默认调用 `build.ps1 -Clean` 重新生成发布产物，也可用 `-NoBuild` 复用现有 `dist/`。
+- 校验工作区干净，创建或复用指向当前 `HEAD` 的 Git tag，并推送 tag 到两个远程。
+- 通过 GitHub Release API 和 Gitee Release API 创建或复用 Release，并上传 `dist/` 下的顶层文件，包括 8 个平台主程序、`simulator.db` 和 `protocol.zip`。
+- `GITHUB_TOKEN` / `GH_TOKEN` 和 `GITEE_TOKEN` 仅从环境变量或参数读取，不写入仓库文件。
+
+## 9. 协议资料
+
+`protocol/` 当前包含测试数据库对应的协议资料：
+
+| 文件 | 对应资料 |
+|------|----------|
+| `8053模块-消防.pdf` | 消防干接点模块 |
+| `Acrel_PZ72(L)-E4.pdf` | 安科瑞 PZ72 电量仪 |
+| `CM+空调通信协议cn.pdf` | Libert CM+ 精密空调 |
+| `ETH-3W微环境温湿度烟雾检测器操作手册.pdf` | ETH-3W 温湿度设备 |
+| `NXr 电总协议.pdf` | UPS 相关协议 |
+| `天方新风1.jpeg` | 天方新风机组 |
+| `天方新风2.jpeg` | 天方新风机组 |
+
+漏水设备协议暂缺。
+
+## 10. 当前依赖
 
 - `modernc.org/sqlite`
 - Go 标准库
