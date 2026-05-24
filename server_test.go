@@ -1,0 +1,417 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"net"
+	"testing"
+	"time"
+)
+
+func TestTryAcquireConnHonorsPerPortLimit(t *testing.T) {
+	port := &PortInfo{}
+
+	if !tryAcquireConn(port, 2) {
+		t.Fatal("first connection was rejected")
+	}
+	if !tryAcquireConn(port, 2) {
+		t.Fatal("second connection was rejected")
+	}
+	if tryAcquireConn(port, 2) {
+		t.Fatal("third connection was accepted, want rejection")
+	}
+	if got := port.activeConns.Load(); got != 2 {
+		t.Fatalf("activeConns = %d, want 2", got)
+	}
+
+	releaseConn(port)
+	if !tryAcquireConn(port, 2) {
+		t.Fatal("connection was rejected after a slot was released")
+	}
+}
+
+func TestTryAcquireConnAllowsUnlimitedWhenMaxConnIsZero(t *testing.T) {
+	port := &PortInfo{}
+
+	for i := 0; i < 10; i++ {
+		if !tryAcquireConn(port, 0) {
+			t.Fatal("unlimited connection mode rejected a connection")
+		}
+	}
+	if got := port.activeConns.Load(); got != 10 {
+		t.Fatalf("activeConns = %d, want 10", got)
+	}
+}
+
+func TestLogRejectedConnectionsResetsCounters(t *testing.T) {
+	port := &PortInfo{Addr: "0.0.0.0:4001"}
+	port.rejectedConns.Add(3)
+
+	logRejectedConnections(map[int64]*PortInfo{4001: port})
+
+	if got := port.rejectedConns.Load(); got != 0 {
+		t.Fatalf("rejectedConns = %d, want 0", got)
+	}
+}
+
+func TestRetryBackoffIsCapped(t *testing.T) {
+	tests := []struct {
+		failCount int
+		want      string
+	}{
+		{failCount: 0, want: "1s"},
+		{failCount: 5, want: "32s"},
+		{failCount: 6, want: "1m0s"},
+		{failCount: 60, want: "1m0s"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			if got := retryBackoff(tt.failCount); got.String() != tt.want {
+				t.Fatalf("retryBackoff(%d) = %s, want %s", tt.failCount, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHandleConnMatchesSplitAndCoalescedCommands(t *testing.T) {
+	port := &PortInfo{Addr: "pipe"}
+	port.addCommandResponse([]byte{0xAA, 0xBB}, "AABB", []byte{0x01})
+	port.addCommandResponse([]byte{0xAA, 0xBB}, "AABB", []byte{0x02})
+	port.addCommandResponse([]byte{0xCC}, "CC", []byte{0x03})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	done := make(chan struct{})
+	go func() {
+		handleConn(ctx, serverConn, port, 0)
+		close(done)
+	}()
+
+	if err := clientConn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	if _, err := clientConn.Write([]byte{0xAA}); err != nil {
+		t.Fatalf("write split prefix: %v", err)
+	}
+	if _, err := clientConn.Write([]byte{0xBB, 0xCC, 0xAA, 0xBB}); err != nil {
+		t.Fatalf("write coalesced commands: %v", err)
+	}
+
+	got := make([]byte, 3)
+	if _, err := io.ReadFull(clientConn, got); err != nil {
+		t.Fatalf("read responses: %v", err)
+	}
+	want := []byte{0x01, 0x03, 0x02}
+	if string(got) != string(want) {
+		t.Fatalf("responses = % X, want % X", got, want)
+	}
+
+	cancel()
+	clientConn.Close()
+	<-done
+}
+
+func TestHandleConnDropsGarbageAndResynchronizes(t *testing.T) {
+	port := &PortInfo{Addr: "pipe"}
+	port.addCommandResponse([]byte{0xAA, 0xBB}, "AABB", []byte{0x01})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	done := make(chan struct{})
+	go func() {
+		handleConn(ctx, serverConn, port, 0)
+		close(done)
+	}()
+
+	if err := clientConn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	if _, err := clientConn.Write([]byte{0x00, 0xAA, 0xBB}); err != nil {
+		t.Fatalf("write garbage plus command: %v", err)
+	}
+
+	got := make([]byte, 1)
+	if _, err := io.ReadFull(clientConn, got); err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if got[0] != 0x01 {
+		t.Fatalf("response = % X, want 01", got)
+	}
+
+	cancel()
+	clientConn.Close()
+	<-done
+}
+
+func TestHandleConnClosesWhenPendingExceedsLimit(t *testing.T) {
+	command := bytes.Repeat([]byte{0xAA}, maxPendingBytes+2)
+	port := &PortInfo{Addr: "pipe"}
+	port.addCommandResponse(command, BytesToHex(command), []byte{0x01})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	done := make(chan struct{})
+	go func() {
+		handleConn(ctx, serverConn, port, 0)
+		close(done)
+	}()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := clientConn.Write(command[:maxPendingBytes+1])
+		writeDone <- err
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleConn did not close an oversized pending buffer")
+	}
+
+	select {
+	case <-writeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client write did not unblock after server closed the connection")
+	}
+}
+
+func TestProcessBufferedCommandsRecoversAfterLargeGarbagePrefix(t *testing.T) {
+	port := &PortInfo{Addr: "pipe"}
+	port.addCommandResponse([]byte{0xAA, 0xBB}, "AABB", []byte{0x01})
+	conn := &recordingConn{}
+	cmdIdx := make(map[string]int)
+	pending := bytes.Repeat([]byte{0x00}, readBufferSize*2)
+	pending = append(pending, 0xAA, 0xBB)
+
+	remaining, ok := processBufferedCommands(context.Background(), conn, port, 0, pending, cmdIdx)
+	if !ok {
+		t.Fatal("processBufferedCommands returned false")
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("remaining pending length = %d, want 0", len(remaining))
+	}
+	if got := conn.buf.Bytes(); !bytes.Equal(got, []byte{0x01}) {
+		t.Fatalf("written response = % X, want 01", got)
+	}
+}
+
+func TestLongestCommandMatchPrefersLongestKnownCommand(t *testing.T) {
+	port := &PortInfo{Addr: "pipe"}
+	port.addCommandResponse([]byte{0xAA, 0xBB}, "AABB", []byte{0x02})
+	port.addCommandResponse([]byte{0xAA}, "AA", []byte{0x01})
+
+	cmd, cmdLen, _ := longestCommandMatch(port, []byte{0xAA, 0xBB})
+	if cmd == nil {
+		t.Fatal("longestCommandMatch returned nil")
+	}
+	if cmdLen != 2 || cmd.HexKey != "AABB" {
+		t.Fatalf("matched %s length %d, want AABB length 2", cmd.HexKey, cmdLen)
+	}
+}
+
+func TestIsCommandPrefixUsesCompleteCommandsAndPrefixes(t *testing.T) {
+	port := &PortInfo{Addr: "pipe"}
+	port.addCommandResponse([]byte{0xAA, 0xBB}, "AABB", []byte{0x01})
+
+	if !isCommandPrefix(port, []byte{0xAA}) {
+		t.Fatal("isCommandPrefix rejected a valid command prefix")
+	}
+	if !isCommandPrefix(port, []byte{0xAA, 0xBB}) {
+		t.Fatal("isCommandPrefix rejected a complete command")
+	}
+	if isCommandPrefix(port, []byte{0xAA, 0xBC}) {
+		t.Fatal("isCommandPrefix accepted an invalid prefix")
+	}
+}
+
+func TestHandleConnClosesOnContextCancel(t *testing.T) {
+	port := &PortInfo{Addr: "pipe"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	done := make(chan struct{})
+	go func() {
+		handleConn(ctx, serverConn, port, 0)
+		close(done)
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleConn did not return after context cancel")
+	}
+}
+
+func TestSetPortRetryIncrementsFailCountWithStatusSnapshot(t *testing.T) {
+	port := &PortInfo{}
+
+	setPortRetry(port)
+	status, failCount, nextRetry := portStatusSnapshot(port)
+	if status != 2 {
+		t.Fatalf("status = %d, want 2", status)
+	}
+	if failCount != 1 {
+		t.Fatalf("failCount = %d, want 1", failCount)
+	}
+	if nextRetry.IsZero() {
+		t.Fatal("nextRetry was not set")
+	}
+
+	setPortStatus(port, 1, 0, time.Time{})
+	status, failCount, nextRetry = portStatusSnapshot(port)
+	if status != 1 || failCount != 0 || !nextRetry.IsZero() {
+		t.Fatalf("snapshot after reset = status:%d failCount:%d nextRetry:%s, want normal zero retry", status, failCount, nextRetry)
+	}
+}
+
+func TestWaitResponseDelayHonorsPortDelayAndContext(t *testing.T) {
+	start := time.Now()
+	if !waitResponseDelay(context.Background(), &PortInfo{Delay: 20}, 0) {
+		t.Fatal("waitResponseDelay returned false without cancellation")
+	}
+	if elapsed := time.Since(start); elapsed < 15*time.Millisecond {
+		t.Fatalf("waitResponseDelay returned too early: %s", elapsed)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if waitResponseDelay(ctx, &PortInfo{Delay: 20}, 0) {
+		t.Fatal("waitResponseDelay returned true after context cancellation")
+	}
+
+	if !waitResponseDelay(context.Background(), &PortInfo{Delay: -1}, 0) {
+		t.Fatal("waitResponseDelay returned false for non-positive delay")
+	}
+}
+
+func TestCompactPendingKeepsAppendHeadroom(t *testing.T) {
+	pending := make([]byte, readBufferSize*4, maxPendingBytes+1)
+	compacted := compactPending(pending)
+
+	if len(compacted) != len(pending) {
+		t.Fatalf("len(compacted) = %d, want %d", len(compacted), len(pending))
+	}
+	if cap(compacted) <= len(compacted) {
+		t.Fatalf("cap(compacted) = %d, want append headroom above len %d", cap(compacted), len(compacted))
+	}
+	if cap(compacted) > maxPendingBytes {
+		t.Fatalf("cap(compacted) = %d, want <= %d", cap(compacted), maxPendingBytes)
+	}
+
+	if compacted := compactPending(nil); compacted != nil {
+		t.Fatalf("compactPending(nil) = %v, want nil", compacted)
+	}
+}
+
+func TestWriteAllHandlesShortWrites(t *testing.T) {
+	conn := &recordingConn{maxWrite: 1}
+
+	if err := writeAll(conn, []byte{0x01, 0x02, 0x03}); err != nil {
+		t.Fatalf("writeAll returned error: %v", err)
+	}
+	if got := conn.buf.Bytes(); !bytes.Equal(got, []byte{0x01, 0x02, 0x03}) {
+		t.Fatalf("written bytes = % X, want 01 02 03", got)
+	}
+}
+
+func TestWriteAllReturnsDeadlineError(t *testing.T) {
+	wantErr := errors.New("deadline failed")
+	conn := &recordingConn{writeDeadlineErr: wantErr}
+
+	if err := writeAll(conn, []byte{0x01}); !errors.Is(err, wantErr) {
+		t.Fatalf("writeAll error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestBuildServerMarksPortForRetryWhenListenFails(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	port := &PortInfo{Addr: listener.Addr().String()}
+	BuildServer(context.Background(), port, 0, 1)
+
+	status, failCount, nextRetry := portStatusSnapshot(port)
+	if status != 2 {
+		t.Fatalf("status = %d, want 2", status)
+	}
+	if failCount != 1 {
+		t.Fatalf("failCount = %d, want 1", failCount)
+	}
+	if nextRetry.IsZero() {
+		t.Fatal("nextRetry was not set")
+	}
+}
+
+type recordingConn struct {
+	buf              bytes.Buffer
+	maxWrite         int
+	writeDeadlineErr error
+}
+
+func (c *recordingConn) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (c *recordingConn) Write(p []byte) (int, error) {
+	n := len(p)
+	if c.maxWrite > 0 && n > c.maxWrite {
+		n = c.maxWrite
+	}
+	c.buf.Write(p[:n])
+	return n, nil
+}
+
+func (c *recordingConn) Close() error {
+	return nil
+}
+
+func (c *recordingConn) LocalAddr() net.Addr {
+	return testAddr("local")
+}
+
+func (c *recordingConn) RemoteAddr() net.Addr {
+	return testAddr("remote")
+}
+
+func (c *recordingConn) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (c *recordingConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *recordingConn) SetWriteDeadline(time.Time) error {
+	return c.writeDeadlineErr
+}
+
+type testAddr string
+
+func (a testAddr) Network() string {
+	return string(a)
+}
+
+func (a testAddr) String() string {
+	return string(a)
+}
