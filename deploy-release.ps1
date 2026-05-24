@@ -119,6 +119,121 @@ function Get-HttpStatusCode {
     }
 }
 
+function Redact-SecretText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) {
+        return $Text
+    }
+
+    $redacted = $Text
+    foreach ($secret in @($GitHubToken, $GiteeToken)) {
+        if (-not [string]::IsNullOrWhiteSpace($secret)) {
+            $redacted = $redacted.Replace($secret, "***")
+        }
+    }
+
+    return $redacted
+}
+
+function Get-RestErrorBody {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    if ($null -ne $ErrorRecord.ErrorDetails -and -not [string]::IsNullOrWhiteSpace($ErrorRecord.ErrorDetails.Message)) {
+        return $ErrorRecord.ErrorDetails.Message
+    }
+
+    $response = $ErrorRecord.Exception.Response
+    if ($null -eq $response) {
+        return ""
+    }
+
+    try {
+        $stream = $response.GetResponseStream()
+        if ($null -eq $stream) {
+            return ""
+        }
+
+        $reader = [System.IO.StreamReader]::new($stream)
+        try {
+            return $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+        }
+    } catch {
+        return ""
+    }
+}
+
+function New-RestErrorMessage {
+    param(
+        [string]$Method,
+        [string]$Uri,
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $status = Get-HttpStatusCode $ErrorRecord
+    $safeUri = Redact-SecretText $Uri
+    $body = Redact-SecretText (Get-RestErrorBody $ErrorRecord)
+    $message = "HTTP request failed: $Method $safeUri"
+
+    if ($null -ne $status) {
+        $message += "`nStatus: $status"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($body)) {
+        $message += "`nResponse: $body"
+    } else {
+        $message += "`nError: $($ErrorRecord.Exception.Message)"
+    }
+
+    return $message
+}
+
+function Invoke-ReleaseRestMethod {
+    param(
+        [string]$Method,
+        [string]$Uri,
+        [hashtable]$Headers = @{},
+        $Body = $null,
+        [string]$ContentType = "",
+        [string]$InFile = "",
+        [switch]$AllowNotFound
+    )
+
+    try {
+        $parameters = @{
+            Method = $Method
+            Uri = $Uri
+            ErrorAction = "Stop"
+        }
+
+        if ($Headers.Count -gt 0) {
+            $parameters.Headers = $Headers
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($ContentType)) {
+            $parameters.ContentType = $ContentType
+        }
+
+        if ($null -ne $Body) {
+            $parameters.Body = $Body
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($InFile)) {
+            $parameters.InFile = $InFile
+        }
+
+        return Invoke-RestMethod @parameters
+    } catch {
+        if ($AllowNotFound -and (Get-HttpStatusCode $_) -eq 404) {
+            return $null
+        }
+
+        throw (New-RestErrorMessage -Method $Method -Uri $Uri -ErrorRecord $_)
+    }
+}
+
 function Invoke-RestAllowNotFound {
     param(
         [string]$Method,
@@ -128,23 +243,7 @@ function Invoke-RestAllowNotFound {
         [string]$ContentType = ""
     )
 
-    try {
-        if ($null -eq $Body) {
-            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers
-        }
-
-        if ([string]::IsNullOrWhiteSpace($ContentType)) {
-            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers -Body $Body
-        }
-
-        return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers -ContentType $ContentType -Body $Body
-    } catch {
-        if ((Get-HttpStatusCode $_) -eq 404) {
-            return $null
-        }
-
-        throw
-    }
+    return Invoke-ReleaseRestMethod -Method $Method -Uri $Uri -Headers $Headers -Body $Body -ContentType $ContentType -AllowNotFound
 }
 
 function Get-GitRemoteUrl {
@@ -407,12 +506,37 @@ function Get-ReleaseAssetID {
     return Get-ObjectPropertyValue -Object $Asset -Names @("id", "uuid")
 }
 
+function Get-TargetCommitish {
+    $branch = (& git branch --show-current).Trim()
+    if ([string]::IsNullOrWhiteSpace($branch)) {
+        return "HEAD"
+    }
+
+    return $branch
+}
+
 function Get-GitHubRelease {
     param([pscustomobject]$RepoInfo)
 
     $headers = Get-GitHubHeaders
     $uri = "$GitHubApiBase/repos/$(ConvertTo-UrlEncoded $RepoInfo.Owner)/$(ConvertTo-UrlEncoded $RepoInfo.Repo)/releases/tags/$(ConvertTo-UrlEncoded $Tag)"
     return Invoke-RestAllowNotFound -Method "Get" -Uri $uri -Headers $headers
+}
+
+function Find-GitHubRelease {
+    param([pscustomobject]$RepoInfo)
+
+    $headers = Get-GitHubHeaders
+    $uri = "$GitHubApiBase/repos/$(ConvertTo-UrlEncoded $RepoInfo.Owner)/$(ConvertTo-UrlEncoded $RepoInfo.Repo)/releases?per_page=100"
+    $releases = @(Invoke-ReleaseRestMethod -Method "Get" -Uri $uri -Headers $headers)
+    foreach ($release in $releases) {
+        $releaseTag = Get-ObjectPropertyValue -Object $release -Names @("tag_name", "tag")
+        if ($releaseTag -eq $Tag) {
+            return $release
+        }
+    }
+
+    return $null
 }
 
 function Save-GitHubRelease {
@@ -423,6 +547,10 @@ function Save-GitHubRelease {
 
     $headers = Get-GitHubHeaders
     $release = Get-GitHubRelease -RepoInfo $RepoInfo
+    if ($null -eq $release) {
+        $release = Find-GitHubRelease -RepoInfo $RepoInfo
+    }
+
     $payload = @{
         tag_name = $Tag
         name = $ReleaseName
@@ -432,19 +560,16 @@ function Save-GitHubRelease {
     }
 
     if ($null -eq $release) {
-        $payload.target_commitish = (& git branch --show-current).Trim()
-        if ([string]::IsNullOrWhiteSpace($payload.target_commitish)) {
-            $payload.target_commitish = "HEAD"
-        }
+        $payload.target_commitish = Get-TargetCommitish
 
         $uri = "$GitHubApiBase/repos/$(ConvertTo-UrlEncoded $RepoInfo.Owner)/$(ConvertTo-UrlEncoded $RepoInfo.Repo)/releases"
         $json = $payload | ConvertTo-Json -Depth 8
-        return Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -ContentType "application/json" -Body $json
+        return Invoke-ReleaseRestMethod -Method "Post" -Uri $uri -Headers $headers -ContentType "application/json" -Body $json
     }
 
     $uri = "$GitHubApiBase/repos/$(ConvertTo-UrlEncoded $RepoInfo.Owner)/$(ConvertTo-UrlEncoded $RepoInfo.Repo)/releases/$($release.id)"
     $json = $payload | ConvertTo-Json -Depth 8
-    return Invoke-RestMethod -Method Patch -Uri $uri -Headers $headers -ContentType "application/json" -Body $json
+    return Invoke-ReleaseRestMethod -Method "Patch" -Uri $uri -Headers $headers -ContentType "application/json" -Body $json
 }
 
 function Publish-GitHubAssets {
@@ -458,7 +583,7 @@ function Publish-GitHubAssets {
     $owner = ConvertTo-UrlEncoded $RepoInfo.Owner
     $repo = ConvertTo-UrlEncoded $RepoInfo.Repo
     $assetListUri = "$GitHubApiBase/repos/$owner/$repo/releases/$($Release.id)/assets?per_page=100"
-    $existingAssets = @(Invoke-RestMethod -Method Get -Uri $assetListUri -Headers $headers)
+    $existingAssets = @(Invoke-ReleaseRestMethod -Method "Get" -Uri $assetListUri -Headers $headers)
 
     foreach ($asset in $Assets) {
         $assetName = $asset.Name
@@ -470,22 +595,33 @@ function Publish-GitHubAssets {
             }
 
             $deleteUri = "$GitHubApiBase/repos/$owner/$repo/releases/assets/$existingID"
-            Invoke-RestMethod -Method Delete -Uri $deleteUri -Headers $headers | Out-Null
+            Invoke-ReleaseRestMethod -Method "Delete" -Uri $deleteUri -Headers $headers | Out-Null
             Write-Host "GitHub deleted existing asset: $assetName" -ForegroundColor Yellow
         }
 
         $uploadUri = "$GitHubUploadBase/repos/$owner/$repo/releases/$($Release.id)/assets?name=$(ConvertTo-UrlEncoded $assetName)"
-        Invoke-RestMethod -Method Post -Uri $uploadUri -Headers $headers -ContentType "application/octet-stream" -InFile $asset.FullName | Out-Null
+        Invoke-ReleaseRestMethod -Method "Post" -Uri $uploadUri -Headers $headers -ContentType "application/octet-stream" -InFile $asset.FullName | Out-Null
         Write-Host "GitHub uploaded: $assetName" -ForegroundColor Green
     }
 }
 
-function Get-GiteeRelease {
+function Find-GiteeRelease {
     param([pscustomobject]$RepoInfo)
 
-    $uri = "$GiteeApiBase/repos/$(ConvertTo-UrlEncoded $RepoInfo.Owner)/$(ConvertTo-UrlEncoded $RepoInfo.Repo)/releases/tags/$(ConvertTo-UrlEncoded $Tag)"
-    $uri = Add-QueryString -Uri $uri -Parameters @{ access_token = $GiteeToken }
-    return Invoke-RestAllowNotFound -Method "Get" -Uri $uri
+    $uri = "$GiteeApiBase/repos/$(ConvertTo-UrlEncoded $RepoInfo.Owner)/$(ConvertTo-UrlEncoded $RepoInfo.Repo)/releases"
+    $uri = Add-QueryString -Uri $uri -Parameters @{
+        access_token = $GiteeToken
+        per_page = 100
+    }
+    $releases = @(Invoke-ReleaseRestMethod -Method "Get" -Uri $uri)
+    foreach ($release in $releases) {
+        $releaseTag = Get-ObjectPropertyValue -Object $release -Names @("tag_name", "tag")
+        if ($releaseTag -eq $Tag) {
+            return $release
+        }
+    }
+
+    return $null
 }
 
 function Save-GiteeRelease {
@@ -494,7 +630,7 @@ function Save-GiteeRelease {
         [string]$Body
     )
 
-    $release = Get-GiteeRelease -RepoInfo $RepoInfo
+    $release = Find-GiteeRelease -RepoInfo $RepoInfo
     if ($null -ne $release) {
         return $release
     }
@@ -505,10 +641,11 @@ function Save-GiteeRelease {
         tag_name = $Tag
         name = $ReleaseName
         body = $Body
+        target_commitish = Get-TargetCommitish
         prerelease = ([bool]$Prerelease).ToString().ToLowerInvariant()
     }
 
-    return Invoke-RestMethod -Method Post -Uri $uri -Body $payload
+    return Invoke-ReleaseRestMethod -Method "Post" -Uri $uri -Body $payload
 }
 
 function Invoke-GiteeFileUpload {
@@ -531,7 +668,9 @@ function Invoke-GiteeFileUpload {
         $response = $client.PostAsync($Uri, $content).GetAwaiter().GetResult()
         $responseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
         if (-not $response.IsSuccessStatusCode) {
-            throw "Gitee upload failed for $($Asset.Name): HTTP $([int]$response.StatusCode) $responseBody"
+            $safeUri = Redact-SecretText $Uri
+            $safeBody = Redact-SecretText $responseBody
+            throw "Gitee upload failed for $($Asset.Name): HTTP $([int]$response.StatusCode) $safeUri`nResponse: $safeBody"
         }
 
         if ([string]::IsNullOrWhiteSpace($responseBody)) {
@@ -558,7 +697,7 @@ function Publish-GiteeAssets {
     $releaseId = ConvertTo-UrlEncoded ([string]$Release.id)
     $assetListUri = "$GiteeApiBase/repos/$owner/$repo/releases/$releaseId/attach_files"
     $assetListUri = Add-QueryString -Uri $assetListUri -Parameters @{ access_token = $GiteeToken }
-    $existingAssets = @(Invoke-RestMethod -Method Get -Uri $assetListUri)
+    $existingAssets = @(Invoke-ReleaseRestMethod -Method "Get" -Uri $assetListUri)
 
     foreach ($asset in $Assets) {
         $assetName = $asset.Name
@@ -571,7 +710,7 @@ function Publish-GiteeAssets {
 
             $deleteUri = "$GiteeApiBase/repos/$owner/$repo/releases/$releaseId/attach_files/$existingID"
             $deleteUri = Add-QueryString -Uri $deleteUri -Parameters @{ access_token = $GiteeToken }
-            Invoke-RestMethod -Method Delete -Uri $deleteUri | Out-Null
+            Invoke-ReleaseRestMethod -Method "Delete" -Uri $deleteUri | Out-Null
             Write-Host "Gitee deleted existing asset: $assetName" -ForegroundColor Yellow
         }
 
