@@ -21,9 +21,6 @@ param(
     [string]$GitHubToken = $(if ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { $env:GH_TOKEN }),
     [string]$GiteeToken = $env:GITEE_TOKEN,
 
-    [string]$GitHubApiBase = "https://api.github.com",
-    [string]$GitHubUploadBase = "https://uploads.github.com",
-    [string]$GitHubApiVersion = "2022-11-28",
     [string]$GiteeApiBase = "https://gitee.com/api/v5",
 
     [switch]$NoBuild,
@@ -97,6 +94,43 @@ function Invoke-Native {
     & $FilePath @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "Command failed: $FilePath $($Arguments -join ' ')"
+    }
+}
+
+function Invoke-NativeCapture {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [switch]$AllowFailure
+    )
+
+    $output = @(& $FilePath @Arguments 2>&1)
+    $exitCode = $LASTEXITCODE
+    $textOutput = @($output | ForEach-Object { [string]$_ })
+
+    if (-not $AllowFailure -and $exitCode -ne 0) {
+        $message = "Command failed ($exitCode): $FilePath $($Arguments -join ' ')"
+        if ($textOutput.Count -gt 0) {
+            $message += "`n$($textOutput -join "`n")"
+        }
+
+        throw $message
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = $textOutput
+    }
+}
+
+function Require-Command {
+    param(
+        [string]$Name,
+        [string]$InstallHint
+    )
+
+    if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+        throw "Command '$Name' was not found. $InstallHint"
     }
 }
 
@@ -311,9 +345,28 @@ function Resolve-RepoInfo {
     return Get-RepoFromRemote -Remote $Remote -ExpectedHost $HostName
 }
 
-function Get-ReleaseBody {
+function Get-RepoSlug {
+    param([pscustomobject]$RepoInfo)
+
+    return "$($RepoInfo.Owner)/$($RepoInfo.Repo)"
+}
+
+function New-NameSet {
+    param([object[]]$Names)
+
+    $set = New-Object "System.Collections.Generic.HashSet[string]" -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in @($Names)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$name)) {
+            [void]$set.Add([string]$name)
+        }
+    }
+
+    return ,$set
+}
+
+function Get-ReleaseBodyPath {
     if ([string]::IsNullOrWhiteSpace($BodyFile)) {
-        return "Release $Tag"
+        return $null
     }
 
     if ([System.IO.Path]::IsPathRooted($BodyFile)) {
@@ -324,6 +377,15 @@ function Get-ReleaseBody {
 
     if (-not (Test-Path -LiteralPath $bodyPath)) {
         throw "Release body file not found: $bodyPath"
+    }
+
+    return $bodyPath
+}
+
+function Get-ReleaseBody {
+    $bodyPath = Get-ReleaseBodyPath
+    if ($null -eq $bodyPath) {
+        return "Release $Tag"
     }
 
     return Get-Content -LiteralPath $bodyPath -Raw
@@ -460,15 +522,6 @@ function Get-DistAssets {
     return $assets
 }
 
-function Get-GitHubHeaders {
-    return @{
-        "Authorization" = "Bearer $GitHubToken"
-        "Accept" = "application/vnd.github+json"
-        "X-GitHub-Api-Version" = $GitHubApiVersion
-        "User-Agent" = "lin-simulator-release-script"
-    }
-}
-
 function Get-ObjectPropertyValue {
     param(
         $Object,
@@ -515,139 +568,6 @@ function Get-TargetCommitish {
     return $branch
 }
 
-function Get-GitHubRelease {
-    param([pscustomobject]$RepoInfo)
-
-    $headers = Get-GitHubHeaders
-    $uri = "$GitHubApiBase/repos/$(ConvertTo-UrlEncoded $RepoInfo.Owner)/$(ConvertTo-UrlEncoded $RepoInfo.Repo)/releases/tags/$(ConvertTo-UrlEncoded $Tag)"
-    return Invoke-RestAllowNotFound -Method "Get" -Uri $uri -Headers $headers
-}
-
-function Find-GitHubRelease {
-    param([pscustomobject]$RepoInfo)
-
-    $headers = Get-GitHubHeaders
-    $uri = "$GitHubApiBase/repos/$(ConvertTo-UrlEncoded $RepoInfo.Owner)/$(ConvertTo-UrlEncoded $RepoInfo.Repo)/releases?per_page=100"
-    $releases = @(Invoke-ReleaseRestMethod -Method "Get" -Uri $uri -Headers $headers)
-    foreach ($release in $releases) {
-        $releaseTag = Get-ObjectPropertyValue -Object $release -Names @("tag_name", "tag")
-        if ($releaseTag -eq $Tag) {
-            return $release
-        }
-    }
-
-    return $null
-}
-
-function Save-GitHubRelease {
-    param(
-        [pscustomobject]$RepoInfo,
-        [string]$Body
-    )
-
-    $headers = Get-GitHubHeaders
-    $release = Get-GitHubRelease -RepoInfo $RepoInfo
-    if ($null -eq $release) {
-        $release = Find-GitHubRelease -RepoInfo $RepoInfo
-    }
-
-    $payload = @{
-        tag_name = $Tag
-        name = $ReleaseName
-        body = $Body
-        draft = $false
-        prerelease = [bool]$Prerelease
-    }
-
-    if ($null -eq $release) {
-        $payload.target_commitish = Get-TargetCommitish
-
-        $uri = "$GitHubApiBase/repos/$(ConvertTo-UrlEncoded $RepoInfo.Owner)/$(ConvertTo-UrlEncoded $RepoInfo.Repo)/releases"
-        $json = $payload | ConvertTo-Json -Depth 8
-        return Invoke-ReleaseRestMethod -Method "Post" -Uri $uri -Headers $headers -ContentType "application/json" -Body $json
-    }
-
-    $uri = "$GitHubApiBase/repos/$(ConvertTo-UrlEncoded $RepoInfo.Owner)/$(ConvertTo-UrlEncoded $RepoInfo.Repo)/releases/$($release.id)"
-    $json = $payload | ConvertTo-Json -Depth 8
-    return Invoke-ReleaseRestMethod -Method "Patch" -Uri $uri -Headers $headers -ContentType "application/json" -Body $json
-}
-
-function Publish-GitHubAssets {
-    param(
-        [pscustomobject]$RepoInfo,
-        $Release,
-        [System.IO.FileInfo[]]$Assets
-    )
-
-    $headers = Get-GitHubHeaders
-    $owner = ConvertTo-UrlEncoded $RepoInfo.Owner
-    $repo = ConvertTo-UrlEncoded $RepoInfo.Repo
-    $assetListUri = "$GitHubApiBase/repos/$owner/$repo/releases/$($Release.id)/assets?per_page=100"
-    $existingAssets = @(Invoke-ReleaseRestMethod -Method "Get" -Uri $assetListUri -Headers $headers)
-
-    foreach ($asset in $Assets) {
-        $assetName = $asset.Name
-        foreach ($existing in @($existingAssets | Where-Object { (Get-ReleaseAssetName $_) -eq $assetName })) {
-            $existingID = Get-ReleaseAssetID $existing
-            if ([string]::IsNullOrWhiteSpace([string]$existingID)) {
-                Write-Host "GitHub skipped existing asset without id: $assetName" -ForegroundColor Yellow
-                continue
-            }
-
-            $deleteUri = "$GitHubApiBase/repos/$owner/$repo/releases/assets/$existingID"
-            Invoke-ReleaseRestMethod -Method "Delete" -Uri $deleteUri -Headers $headers | Out-Null
-            Write-Host "GitHub deleted existing asset: $assetName" -ForegroundColor Yellow
-        }
-
-        $uploadUri = "$GitHubUploadBase/repos/$owner/$repo/releases/$($Release.id)/assets?name=$(ConvertTo-UrlEncoded $assetName)"
-        Invoke-ReleaseRestMethod -Method "Post" -Uri $uploadUri -Headers $headers -ContentType "application/octet-stream" -InFile $asset.FullName | Out-Null
-        Write-Host "GitHub uploaded: $assetName" -ForegroundColor Green
-    }
-}
-
-function Find-GiteeRelease {
-    param([pscustomobject]$RepoInfo)
-
-    $uri = "$GiteeApiBase/repos/$(ConvertTo-UrlEncoded $RepoInfo.Owner)/$(ConvertTo-UrlEncoded $RepoInfo.Repo)/releases"
-    $uri = Add-QueryString -Uri $uri -Parameters @{
-        access_token = $GiteeToken
-        per_page = 100
-    }
-    $releases = @(Invoke-ReleaseRestMethod -Method "Get" -Uri $uri)
-    foreach ($release in $releases) {
-        $releaseTag = Get-ObjectPropertyValue -Object $release -Names @("tag_name", "tag")
-        if ($releaseTag -eq $Tag) {
-            return $release
-        }
-    }
-
-    return $null
-}
-
-function Save-GiteeRelease {
-    param(
-        [pscustomobject]$RepoInfo,
-        [string]$Body
-    )
-
-    $release = Find-GiteeRelease -RepoInfo $RepoInfo
-    if ($null -ne $release) {
-        return $release
-    }
-
-    $uri = "$GiteeApiBase/repos/$(ConvertTo-UrlEncoded $RepoInfo.Owner)/$(ConvertTo-UrlEncoded $RepoInfo.Repo)/releases"
-    $payload = @{
-        access_token = $GiteeToken
-        tag_name = $Tag
-        name = $ReleaseName
-        body = $Body
-        target_commitish = Get-TargetCommitish
-        prerelease = ([bool]$Prerelease).ToString().ToLowerInvariant()
-    }
-
-    return Invoke-ReleaseRestMethod -Method "Post" -Uri $uri -Body $payload
-}
-
 function Invoke-GiteeFileUpload {
     param(
         [string]$Uri,
@@ -685,6 +605,180 @@ function Invoke-GiteeFileUpload {
     }
 }
 
+function Set-GitHubCliToken {
+    if ([string]::IsNullOrWhiteSpace($GitHubToken)) {
+        return
+    }
+
+    $env:GH_TOKEN = $GitHubToken
+    $env:GITHUB_TOKEN = $GitHubToken
+}
+
+function Get-GitHubNotesArguments {
+    param([string]$Body)
+
+    $bodyPath = Get-ReleaseBodyPath
+    if ($null -ne $bodyPath) {
+        return @("--notes-file", $bodyPath)
+    }
+
+    return @("--notes", $Body)
+}
+
+function Save-GitHubRelease {
+    param(
+        [pscustomobject]$RepoInfo,
+        [string]$Body
+    )
+
+    $repoSlug = Get-RepoSlug -RepoInfo $RepoInfo
+    $targetCommitish = Get-TargetCommitish
+    $notesArguments = @(Get-GitHubNotesArguments -Body $Body)
+    $viewResult = Invoke-NativeCapture -FilePath "gh" -Arguments @("release", "view", $Tag, "--repo", $repoSlug) -AllowFailure
+
+    if ($viewResult.ExitCode -ne 0) {
+        $createArguments = @("release", "create", $Tag, "--repo", $repoSlug, "--title", $ReleaseName, "--target", $targetCommitish, "--verify-tag")
+        $createArguments += $notesArguments
+        if ($Prerelease) {
+            $createArguments += "--prerelease"
+        }
+
+        Write-Host "GitHub creating release..." -ForegroundColor Yellow
+        Invoke-NativeCapture -FilePath "gh" -Arguments $createArguments | Out-Null
+        return
+    }
+
+    $editArguments = @("release", "edit", $Tag, "--repo", $repoSlug, "--title", $ReleaseName, "--target", $targetCommitish)
+    $editArguments += $notesArguments
+    if ($Prerelease) {
+        $editArguments += "--prerelease"
+    }
+
+    Write-Host "GitHub release exists. Updating metadata..." -ForegroundColor Yellow
+    Invoke-NativeCapture -FilePath "gh" -Arguments $editArguments | Out-Null
+}
+
+function Get-GitHubAssetNames {
+    param([pscustomobject]$RepoInfo)
+
+    $repoSlug = Get-RepoSlug -RepoInfo $RepoInfo
+    $result = Invoke-NativeCapture -FilePath "gh" -Arguments @("release", "view", $Tag, "--repo", $repoSlug, "--json", "assets", "--jq", ".assets[].name")
+    return @($result.Output | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+}
+
+function Publish-GitHubAssets {
+    param(
+        [pscustomobject]$RepoInfo,
+        [System.IO.FileInfo[]]$Assets
+    )
+
+    $repoSlug = Get-RepoSlug -RepoInfo $RepoInfo
+    $assetsToUpload = @()
+
+    if ($ForceTag) {
+        $assetsToUpload = @($Assets)
+    } else {
+        $existingNames = New-NameSet -Names (Get-GitHubAssetNames -RepoInfo $RepoInfo)
+        foreach ($asset in $Assets) {
+            if ($existingNames.Contains($asset.Name)) {
+                Write-Host "Skip existing GitHub asset: $($asset.Name)" -ForegroundColor Yellow
+            } else {
+                $assetsToUpload += $asset
+            }
+        }
+    }
+
+    if ($assetsToUpload.Count -eq 0) {
+        Write-Host "No GitHub assets to upload." -ForegroundColor Green
+        return
+    }
+
+    $uploadArguments = @("release", "upload", $Tag, "--repo", $repoSlug)
+    if ($ForceTag) {
+        $uploadArguments += "--clobber"
+    }
+
+    foreach ($asset in $assetsToUpload) {
+        $uploadArguments += $asset.FullName
+    }
+
+    Write-Host "Uploading GitHub assets:" -ForegroundColor Cyan
+    foreach ($asset in $assetsToUpload) {
+        Write-Host " - $($asset.Name)"
+    }
+
+    Invoke-NativeCapture -FilePath "gh" -Arguments $uploadArguments | Out-Null
+}
+
+function Get-GiteeRelease {
+    param([pscustomobject]$RepoInfo)
+
+    $uri = "$GiteeApiBase/repos/$(ConvertTo-UrlEncoded $RepoInfo.Owner)/$(ConvertTo-UrlEncoded $RepoInfo.Repo)/releases/tags/$(ConvertTo-UrlEncoded $Tag)"
+    $uri = Add-QueryString -Uri $uri -Parameters @{ access_token = $GiteeToken }
+    return Invoke-RestAllowNotFound -Method "Get" -Uri $uri
+}
+
+function Save-GiteeRelease {
+    param(
+        [pscustomobject]$RepoInfo,
+        [string]$Body
+    )
+
+    $release = Get-GiteeRelease -RepoInfo $RepoInfo
+    if ($null -ne $release) {
+        return $release
+    }
+
+    $uri = "$GiteeApiBase/repos/$(ConvertTo-UrlEncoded $RepoInfo.Owner)/$(ConvertTo-UrlEncoded $RepoInfo.Repo)/releases"
+    $payload = @{
+        access_token = $GiteeToken
+        tag_name = $Tag
+        name = $ReleaseName
+        body = $Body
+        target_commitish = Get-TargetCommitish
+    }
+
+    if ($Prerelease) {
+        $payload.prerelease = "true"
+    }
+
+    Write-Host "Gitee creating release..." -ForegroundColor Yellow
+    return Invoke-ReleaseRestMethod -Method "Post" -Uri $uri -Body $payload
+}
+
+function Get-GiteeReleaseAssets {
+    param(
+        [pscustomobject]$RepoInfo,
+        $Release
+    )
+
+    $owner = ConvertTo-UrlEncoded $RepoInfo.Owner
+    $repo = ConvertTo-UrlEncoded $RepoInfo.Repo
+    $releaseId = ConvertTo-UrlEncoded ([string]$Release.id)
+    $assetListUri = "$GiteeApiBase/repos/$owner/$repo/releases/$releaseId/attach_files"
+    $assetListUri = Add-QueryString -Uri $assetListUri -Parameters @{
+        access_token = $GiteeToken
+        per_page = 100
+    }
+
+    return @(Invoke-ReleaseRestMethod -Method "Get" -Uri $assetListUri)
+}
+
+function Remove-GiteeReleaseAsset {
+    param(
+        [pscustomobject]$RepoInfo,
+        $Release,
+        [string]$AssetID
+    )
+
+    $owner = ConvertTo-UrlEncoded $RepoInfo.Owner
+    $repo = ConvertTo-UrlEncoded $RepoInfo.Repo
+    $releaseId = ConvertTo-UrlEncoded ([string]$Release.id)
+    $deleteUri = "$GiteeApiBase/repos/$owner/$repo/releases/$releaseId/attach_files/$AssetID"
+    $deleteUri = Add-QueryString -Uri $deleteUri -Parameters @{ access_token = $GiteeToken }
+    Invoke-ReleaseRestMethod -Method "Delete" -Uri $deleteUri | Out-Null
+}
+
 function Publish-GiteeAssets {
     param(
         [pscustomobject]$RepoInfo,
@@ -692,32 +786,51 @@ function Publish-GiteeAssets {
         [System.IO.FileInfo[]]$Assets
     )
 
+    $existingAssets = @(Get-GiteeReleaseAssets -RepoInfo $RepoInfo -Release $Release)
+    $assetsToUpload = @()
+
+    if ($ForceTag) {
+        foreach ($asset in $Assets) {
+            $assetName = $asset.Name
+            foreach ($existing in @($existingAssets | Where-Object { (Get-ReleaseAssetName $_) -eq $assetName })) {
+                $existingID = [string](Get-ReleaseAssetID $existing)
+                if ([string]::IsNullOrWhiteSpace($existingID)) {
+                    Write-Host "Gitee skipped existing asset without id: $assetName" -ForegroundColor Yellow
+                    continue
+                }
+
+                Remove-GiteeReleaseAsset -RepoInfo $RepoInfo -Release $Release -AssetID $existingID
+                Write-Host "Gitee deleted existing asset: $assetName" -ForegroundColor Yellow
+            }
+
+            $assetsToUpload += $asset
+        }
+    } else {
+        $existingNames = New-NameSet -Names (@($existingAssets | ForEach-Object { Get-ReleaseAssetName $_ }))
+        foreach ($asset in $Assets) {
+            if ($existingNames.Contains($asset.Name)) {
+                Write-Host "Skip existing Gitee asset: $($asset.Name)" -ForegroundColor Yellow
+            } else {
+                $assetsToUpload += $asset
+            }
+        }
+    }
+
+    if ($assetsToUpload.Count -eq 0) {
+        Write-Host "No Gitee assets to upload." -ForegroundColor Green
+        return
+    }
+
     $owner = ConvertTo-UrlEncoded $RepoInfo.Owner
     $repo = ConvertTo-UrlEncoded $RepoInfo.Repo
     $releaseId = ConvertTo-UrlEncoded ([string]$Release.id)
-    $assetListUri = "$GiteeApiBase/repos/$owner/$repo/releases/$releaseId/attach_files"
-    $assetListUri = Add-QueryString -Uri $assetListUri -Parameters @{ access_token = $GiteeToken }
-    $existingAssets = @(Invoke-ReleaseRestMethod -Method "Get" -Uri $assetListUri)
+    $uploadUri = "$GiteeApiBase/repos/$owner/$repo/releases/$releaseId/attach_files"
+    $uploadUri = Add-QueryString -Uri $uploadUri -Parameters @{ access_token = $GiteeToken }
 
-    foreach ($asset in $Assets) {
-        $assetName = $asset.Name
-        foreach ($existing in @($existingAssets | Where-Object { (Get-ReleaseAssetName $_) -eq $assetName })) {
-            $existingID = Get-ReleaseAssetID $existing
-            if ([string]::IsNullOrWhiteSpace([string]$existingID)) {
-                Write-Host "Gitee skipped existing asset without id: $assetName" -ForegroundColor Yellow
-                continue
-            }
-
-            $deleteUri = "$GiteeApiBase/repos/$owner/$repo/releases/$releaseId/attach_files/$existingID"
-            $deleteUri = Add-QueryString -Uri $deleteUri -Parameters @{ access_token = $GiteeToken }
-            Invoke-ReleaseRestMethod -Method "Delete" -Uri $deleteUri | Out-Null
-            Write-Host "Gitee deleted existing asset: $assetName" -ForegroundColor Yellow
-        }
-
-        $uploadUri = "$GiteeApiBase/repos/$owner/$repo/releases/$releaseId/attach_files"
-        $uploadUri = Add-QueryString -Uri $uploadUri -Parameters @{ access_token = $GiteeToken }
+    Write-Host "Uploading Gitee assets:" -ForegroundColor Cyan
+    foreach ($asset in $assetsToUpload) {
+        Write-Host " - $($asset.Name)"
         Invoke-GiteeFileUpload -Uri $uploadUri -Asset $asset | Out-Null
-        Write-Host "Gitee uploaded: $assetName" -ForegroundColor Green
     }
 }
 
@@ -736,8 +849,16 @@ function Publish-GitHubRelease {
         return
     }
 
-    $release = Save-GitHubRelease -RepoInfo $RepoInfo -Body $Body
-    Publish-GitHubAssets -RepoInfo $RepoInfo -Release $release -Assets $Assets
+    Set-GitHubCliToken
+    if ([string]::IsNullOrWhiteSpace($GitHubToken)) {
+        $authStatus = Invoke-NativeCapture -FilePath "gh" -Arguments @("auth", "status", "--hostname", "github.com") -AllowFailure
+        if ($authStatus.ExitCode -ne 0) {
+            throw "GitHub CLI is not authenticated. Run gh auth login, or set GITHUB_TOKEN/GH_TOKEN."
+        }
+    }
+
+    Save-GitHubRelease -RepoInfo $RepoInfo -Body $Body
+    Publish-GitHubAssets -RepoInfo $RepoInfo -Assets $Assets
 }
 
 function Publish-GiteeRelease {
@@ -777,8 +898,8 @@ try {
 
         if ($publishGitHub) {
             $githubInfo = Resolve-RepoInfo -Owner $GitHubOwner -Repo $GitHubRepo -Remote $GitHubRemote -HostName "github.com"
-            if (-not $DryRun -and [string]::IsNullOrWhiteSpace($GitHubToken)) {
-                throw "Missing GitHub token. Set GITHUB_TOKEN or GH_TOKEN, or pass -GitHubToken."
+            if (-not $DryRun) {
+                Require-Command -Name "gh" -InstallHint "Install GitHub CLI and ensure 'gh' is available in PATH."
             }
         }
 
