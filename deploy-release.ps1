@@ -354,6 +354,43 @@ function Get-GitHubHeaders {
     }
 }
 
+function Get-ObjectPropertyValue {
+    param(
+        $Object,
+        [string[]]$Names
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+
+    foreach ($name in $Names) {
+        $property = $Object.PSObject.Properties[$name]
+        if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return $property.Value
+        }
+    }
+
+    return $null
+}
+
+function Get-ReleaseAssetName {
+    param($Asset)
+
+    $name = Get-ObjectPropertyValue -Object $Asset -Names @("name", "filename", "file_name", "path")
+    if ([string]::IsNullOrWhiteSpace([string]$name)) {
+        return ""
+    }
+
+    return [System.IO.Path]::GetFileName([string]$name)
+}
+
+function Get-ReleaseAssetID {
+    param($Asset)
+
+    return Get-ObjectPropertyValue -Object $Asset -Names @("id", "uuid")
+}
+
 function Get-GitHubRelease {
     param([pscustomobject]$RepoInfo)
 
@@ -409,8 +446,14 @@ function Publish-GitHubAssets {
 
     foreach ($asset in $Assets) {
         $assetName = $asset.Name
-        foreach ($existing in @($existingAssets | Where-Object { $_.name -eq $assetName })) {
-            $deleteUri = "$GitHubApiBase/repos/$owner/$repo/releases/assets/$($existing.id)"
+        foreach ($existing in @($existingAssets | Where-Object { (Get-ReleaseAssetName $_) -eq $assetName })) {
+            $existingID = Get-ReleaseAssetID $existing
+            if ([string]::IsNullOrWhiteSpace([string]$existingID)) {
+                Write-Host "GitHub skipped existing asset without id: $assetName" -ForegroundColor Yellow
+                continue
+            }
+
+            $deleteUri = "$GitHubApiBase/repos/$owner/$repo/releases/assets/$existingID"
             Invoke-RestMethod -Method Delete -Uri $deleteUri -Headers $headers | Out-Null
             Write-Host "GitHub deleted existing asset: $assetName" -ForegroundColor Yellow
         }
@@ -450,18 +493,6 @@ function Save-GiteeRelease {
     }
 
     return Invoke-RestMethod -Method Post -Uri $uri -Body $payload
-}
-
-function Get-GiteeAssetName {
-    param($Asset)
-
-    foreach ($propertyName in @("name", "filename", "file_name")) {
-        if ($null -ne $Asset.PSObject.Properties[$propertyName] -and -not [string]::IsNullOrWhiteSpace([string]$Asset.$propertyName)) {
-            return [string]$Asset.$propertyName
-        }
-    }
-
-    return ""
 }
 
 function Invoke-GiteeFileUpload {
@@ -515,8 +546,14 @@ function Publish-GiteeAssets {
 
     foreach ($asset in $Assets) {
         $assetName = $asset.Name
-        foreach ($existing in @($existingAssets | Where-Object { (Get-GiteeAssetName $_) -eq $assetName })) {
-            $deleteUri = "$GiteeApiBase/repos/$owner/$repo/releases/$releaseId/attach_files/$($existing.id)"
+        foreach ($existing in @($existingAssets | Where-Object { (Get-ReleaseAssetName $_) -eq $assetName })) {
+            $existingID = Get-ReleaseAssetID $existing
+            if ([string]::IsNullOrWhiteSpace([string]$existingID)) {
+                Write-Host "Gitee skipped existing asset without id: $assetName" -ForegroundColor Yellow
+                continue
+            }
+
+            $deleteUri = "$GiteeApiBase/repos/$owner/$repo/releases/$releaseId/attach_files/$existingID"
             $deleteUri = Add-QueryString -Uri $deleteUri -Parameters @{ access_token = $GiteeToken }
             Invoke-RestMethod -Method Delete -Uri $deleteUri | Out-Null
             Write-Host "Gitee deleted existing asset: $assetName" -ForegroundColor Yellow
